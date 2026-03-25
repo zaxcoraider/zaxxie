@@ -105,7 +105,7 @@ const handler = createMcpHandler(
     });
 
   },
-  { name: "zaxxie", version: "3.0.0" },
+  {},
   { basePath: "/api", maxDuration: 60 }
 );
 

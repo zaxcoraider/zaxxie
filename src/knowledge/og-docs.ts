@@ -38,11 +38,18 @@ export const OG_KNOWLEDGE = {
       daEntranceContract: "0x857C0A28A8634614BB2C96039Cf4a20AFF709Aa9",
     },
     mainnet: {
-      name: "0G-Mainnet", chainId: 16661, tokenSymbol: "0G",
+      name: "0G-Aristotle-Mainnet", chainId: 16661, tokenSymbol: "0G",
       rpc: "https://evmrpc.0g.ai",
       explorer: "https://chainscan.0g.ai",
       storageExplorer: "https://storagescan.0g.ai",
       verifierUrl: "https://chainscan.0g.ai/open/api",
+      storageIndexerRpc: "https://indexer-storage-turbo.0g.ai",
+      contracts: {
+        storageFlow: "0x62D4144dB0F0a6fBBaeb6296c785C71B3D57C526",
+        storageMine: "0xCd01c5Cd953971CE4C2c9bFb95610236a7F414fe",
+        storageReward: "0x457aC76B58ffcDc118AABD6DbC63ff9072880870",
+      },
+      thirdPartyRpcs: ["QuickNode", "ThirdWeb", "Ankr"],
     }
   },
 
@@ -105,8 +112,15 @@ module.exports = {
     overview: "Decentralized, AI-optimized storage with ultra-low costs and verifiable permanence. TypeScript and Go SDKs available.",
     setup: `import { ZgFile, Indexer, Batcher, KvClient } from '@0gfoundation/0g-ts-sdk';
 import { ethers } from 'ethers';
+
+// Testnet (Galileo)
 const RPC_URL = 'https://evmrpc-testnet.0g.ai';
-const INDEXER_RPC = 'https://indexer-storage-testnet-turbo.0g.ai';
+const INDEXER_RPC = 'https://indexer-storage-testnet-turbo.0g.ai'; // Public storage indexer (testnet)
+
+// Mainnet (Aristotle)
+// const RPC_URL = 'https://evmrpc.0g.ai';
+// const INDEXER_RPC = 'https://indexer-storage-turbo.0g.ai'; // Public storage indexer (mainnet)
+
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 const indexer = new Indexer(INDEXER_RPC);`,

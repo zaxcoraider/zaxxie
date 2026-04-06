@@ -92,6 +92,9 @@ export default function Home() {
         </tr></thead>
         <tbody>
           {[
+            ["zaxxie_build", "⭐ Main tool — describe any idea, get a complete runnable dApp with all files"],
+            ["zaxxie_onboard", "Wallet setup, MetaMask, add 0G network, get testnet tokens — for beginners"],
+            ["zaxxie_troubleshoot", "Fix common errors — EVM version, gas, storage, compute, deploy issues"],
             ["zaxxie_get_docs", "Full 0G docs — chain, storage, compute, DA, INFTs"],
             ["zaxxie_scaffold", "Generate complete project scaffolds with all code"],
             ["zaxxie_network", "RPCs, chain IDs, contracts, faucets, explorer links"],

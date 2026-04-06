@@ -186,15 +186,19 @@ export default function Home() {
           </h2>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(380px, 1fr))", gap: 10 }}>
             {[
-              { name: "zaxxie_build", star: true, desc: "Describe any idea → get a structured project with every file written to disk automatically" },
-              { name: "zaxxie_check_wallet", star: true, desc: "Live wallet balance, tx count, faucet eligibility — checks directly on 0G RPC" },
-              { name: "zaxxie_check_tx", star: true, desc: "Live transaction status — success/fail, gas used, contract address, explorer link" },
-              { name: "zaxxie_live_docs", star: true, desc: "Fetch latest docs directly from docs.0g.ai — always up to date" },
+              { name: "zaxxie_build", star: true, desc: "Describe any idea → every file written to disk, install commands, step-by-step guide" },
+              { name: "zaxxie_check_wallet", star: true, desc: "Live wallet balance & tx count from 0G RPC — faucet links if empty" },
+              { name: "zaxxie_check_tx", star: true, desc: "Live tx status — confirmed/pending/failed, gas, contract address, explorer link" },
+              { name: "zaxxie_live_docs", star: true, desc: "Fetch latest docs directly from docs.0g.ai — always current" },
+              { name: "zaxxie_faucet", star: true, desc: "Check balance + exact faucet instructions to get testnet 0G tokens" },
+              { name: "zaxxie_verify_contract", star: true, desc: "Check if a contract is verified on 0G explorer + return ABI if available" },
+              { name: "zaxxie_preflight", star: true, desc: "Pre-deploy health check — wallet, RPC, storage indexer, compute marketplace" },
+              { name: "zaxxie_deploy_contract", star: true, desc: "Deploy compiled contract to 0G testnet server-side — returns address + explorer link" },
               { name: "zaxxie_onboard", star: false, desc: "MetaMask setup, add 0G network, get testnet tokens — full beginner guide" },
               { name: "zaxxie_troubleshoot", star: false, desc: "Paste any error → get the exact fix for 0G-specific issues" },
               { name: "zaxxie_get_docs", star: false, desc: "Complete 0G documentation — chain, storage, compute, DA, INFTs" },
               { name: "zaxxie_scaffold", star: false, desc: "Generate project scaffolds with package.json, configs, and working code" },
-              { name: "zaxxie_network", star: false, desc: "RPCs, chain IDs, contract addresses, storage indexers, faucets" },
+              { name: "zaxxie_network", star: false, desc: "RPCs, chain IDs, storage indexers, contract addresses, faucets" },
               { name: "zaxxie_models", star: false, desc: "Available AI models on 0G Compute with pricing and endpoints" },
             ].map((tool) => (
               <div key={tool.name} style={{

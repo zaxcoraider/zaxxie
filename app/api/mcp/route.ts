@@ -1,202 +1,147 @@
 import { z } from "zod";
 import { createMcpHandler } from "mcp-handler";
+import { ethers } from "ethers";
 import { OG_KNOWLEDGE } from "@/knowledge/og-docs";
 
-// ─── RPC helpers (live on-chain reads) ────────────────────────────────────────
+// ─── Network constants ────────────────────────────────────────────────────────
 
 const RPC = {
   testnet: "https://evmrpc-testnet.0g.ai",
   mainnet: "https://evmrpc.0g.ai",
-};
+} as const;
+
+const INDEXER = {
+  testnet: "https://indexer-storage-testnet-turbo.0g.ai",
+  mainnet: "https://indexer-storage-turbo.0g.ai",
+} as const;
 
 const EXPLORER = {
   testnet: "https://chainscan-galileo.0g.ai",
   mainnet: "https://chainscan.0g.ai",
-};
+} as const;
 
-async function rpcCall(network: "testnet" | "mainnet", method: string, params: unknown[]) {
+const CHAIN_ID = { testnet: 16602, mainnet: 16661 } as const;
+
+// ─── RPC helpers ──────────────────────────────────────────────────────────────
+
+async function rpc(
+  network: keyof typeof RPC,
+  method: string,
+  params: unknown[]
+): Promise<unknown> {
   const res = await fetch(RPC[network], {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", method, params, id: 1 }),
+    signal: AbortSignal.timeout(10_000),
   });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.result;
+  if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.error) throw new Error(json.error.message ?? JSON.stringify(json.error));
+  return json.result ?? null;
 }
 
-function hexToDecimal(hex: string): bigint {
-  return BigInt(hex);
-}
-
-function formatBalance(wei: bigint): string {
+function hexToEth(hex: string | null | undefined): string {
+  if (!hex || hex === "0x") return "0.000000";
+  const wei = BigInt(hex);
   const whole = wei / BigInt(1e18);
   const frac = (wei % BigInt(1e18)).toString().padStart(18, "0").slice(0, 6);
   return `${whole}.${frac}`;
 }
 
+function hexToInt(hex: string | null | undefined): number {
+  if (!hex || hex === "0x") return 0;
+  return parseInt(hex, 16);
+}
+
 // ─── Docs builder ─────────────────────────────────────────────────────────────
 
 function buildDocs(topic: string): string {
-  let docs = "";
-  if (topic === "chain" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\n0G CHAIN — Smart Contract Deployment\n${"=".repeat(60)}\n${OG_KNOWLEDGE.chain.overview}\n\nHardhat Config:\n${OG_KNOWLEDGE.chain.hardhatConfig}\n\nSample Contract:\n${OG_KNOWLEDGE.chain.sampleContract}\n\nDeploy Script:\n${OG_KNOWLEDGE.chain.deployScript}\n\nFoundry Deploy:\n${OG_KNOWLEDGE.chain.foundryDeploy}\n\nVerify:\n${OG_KNOWLEDGE.chain.verify}\n\nPrecompiles: ${JSON.stringify(OG_KNOWLEDGE.chain.precompiles)}\nDeployment Scripts: ${OG_KNOWLEDGE.chain.deploymentScripts}\n`;
-  }
-  if (topic === "storage" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\n0G STORAGE SDK\n${"=".repeat(60)}\n${OG_KNOWLEDGE.storage.overview}\nInstall: ${OG_KNOWLEDGE.sdks.storage_ts.install}\nStarter Kit: ${OG_KNOWLEDGE.sdks.storage_ts.starterKit}\n\nSetup:\n${OG_KNOWLEDGE.storage.setup}\n\nUpload:\n${OG_KNOWLEDGE.storage.upload}\n\nDownload:\n${OG_KNOWLEDGE.storage.download}\n\nKV Storage:\n${OG_KNOWLEDGE.storage.kvStorage}\n\nBrowser:\n${OG_KNOWLEDGE.storage.browser}\n\nStreams:\n${OG_KNOWLEDGE.storage.stream}\n`;
-  }
-  if (topic === "compute" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\n0G COMPUTE — AI Inference\n${"=".repeat(60)}\n${OG_KNOWLEDGE.compute.overview}\nInstall: ${OG_KNOWLEDGE.sdks.compute_broker.install}\nMarketplace: ${OG_KNOWLEDGE.networks.testnet.computeMarketplace}\n\nModels (Mainnet): ${JSON.stringify(OG_KNOWLEDGE.compute.services.mainnet, null, 2)}\n\nSDK Setup:\n${OG_KNOWLEDGE.compute.sdkSetup}\n\nChat Completion:\n${OG_KNOWLEDGE.compute.chatCompletion}\n\nText-to-Image:\n${OG_KNOWLEDGE.compute.textToImage}\n\nSpeech-to-Text:\n${OG_KNOWLEDGE.compute.speechToText}\n\nCLI:\n${OG_KNOWLEDGE.compute.cliCommands}\n\ncURL:\n${OG_KNOWLEDGE.compute.directApiCurl}\n`;
-  }
-  if (topic === "da" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\n0G DATA AVAILABILITY (DA)\n${"=".repeat(60)}\n${OG_KNOWLEDGE.da.overview}\nComponents: ${OG_KNOWLEDGE.da.components}\nClient: ${OG_KNOWLEDGE.da.clientRepo}\nEncoder: ${OG_KNOWLEDGE.da.encoderRepo}\nRetriever: ${OG_KNOWLEDGE.da.retrieverRepo}\nExample: ${OG_KNOWLEDGE.da.exampleRepo}\n\nDocker:\n${OG_KNOWLEDGE.da.dockerSetup}\n\nEnv:\n${OG_KNOWLEDGE.da.envConfig}\n\nRollups: ${OG_KNOWLEDGE.da.rollups.join(", ")}\n`;
-  }
-  if (topic === "infts" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\nINFTs — ERC-7857\n${"=".repeat(60)}\n${OG_KNOWLEDGE.infts.overview}\nFeatures: ${OG_KNOWLEDGE.infts.features.join(", ")}\nTransfer: ${OG_KNOWLEDGE.infts.transferFlow}\nUse Cases: ${OG_KNOWLEDGE.infts.useCases.join(", ")}\n\nSetup:\n${OG_KNOWLEDGE.infts.setupCode}\n\nDeploy:\n${OG_KNOWLEDGE.infts.contractExample}\n\nRepo: ${OG_KNOWLEDGE.infts.repo}\n`;
-  }
-  if (topic === "network" || topic === "all") {
-    docs += `\n${"=".repeat(60)}\nNETWORK CONFIG\n${"=".repeat(60)}\n${JSON.stringify(OG_KNOWLEDGE.networks, null, 2)}\nSDKs: ${JSON.stringify(OG_KNOWLEDGE.sdks, null, 2)}\nLinks: ${JSON.stringify(OG_KNOWLEDGE.links, null, 2)}\n`;
-  }
-  docs += `\n${"=".repeat(60)}\nIMPORTANT NOTES\n${"=".repeat(60)}\n${OG_KNOWLEDGE.importantNotes.join("\n")}\n`;
-  return docs;
+  let d = "";
+  const hr = "=".repeat(60);
+  if (topic === "chain" || topic === "all")
+    d += `\n${hr}\n0G CHAIN\n${hr}\n${OG_KNOWLEDGE.chain.overview}\n\nHardhat Config:\n${OG_KNOWLEDGE.chain.hardhatConfig}\n\nSample Contract:\n${OG_KNOWLEDGE.chain.sampleContract}\n\nDeploy Script:\n${OG_KNOWLEDGE.chain.deployScript}\n\nFoundry:\n${OG_KNOWLEDGE.chain.foundryDeploy}\n\nVerify:\n${OG_KNOWLEDGE.chain.verify}\n`;
+  if (topic === "storage" || topic === "all")
+    d += `\n${hr}\n0G STORAGE\n${hr}\n${OG_KNOWLEDGE.storage.overview}\nInstall: ${OG_KNOWLEDGE.sdks.storage_ts.install}\n\nSetup:\n${OG_KNOWLEDGE.storage.setup}\n\nUpload:\n${OG_KNOWLEDGE.storage.upload}\n\nDownload:\n${OG_KNOWLEDGE.storage.download}\n\nKV:\n${OG_KNOWLEDGE.storage.kvStorage}\n`;
+  if (topic === "compute" || topic === "all")
+    d += `\n${hr}\n0G COMPUTE\n${hr}\n${OG_KNOWLEDGE.compute.overview}\nInstall: ${OG_KNOWLEDGE.sdks.compute_broker.install}\n\nSDK Setup:\n${OG_KNOWLEDGE.compute.sdkSetup}\n\nChat:\n${OG_KNOWLEDGE.compute.chatCompletion}\n\nImage:\n${OG_KNOWLEDGE.compute.textToImage}\n\nSpeech:\n${OG_KNOWLEDGE.compute.speechToText}\n`;
+  if (topic === "da" || topic === "all")
+    d += `\n${hr}\n0G DA\n${hr}\n${OG_KNOWLEDGE.da.overview}\n\nDocker:\n${OG_KNOWLEDGE.da.dockerSetup}\n\nEnv:\n${OG_KNOWLEDGE.da.envConfig}\n`;
+  if (topic === "infts" || topic === "all")
+    d += `\n${hr}\nINFTs (ERC-7857)\n${hr}\n${OG_KNOWLEDGE.infts.overview}\n\nSetup:\n${OG_KNOWLEDGE.infts.setupCode}\n\nDeploy:\n${OG_KNOWLEDGE.infts.contractExample}\n`;
+  if (topic === "network" || topic === "all")
+    d += `\n${hr}\nNETWORK\n${hr}\n${JSON.stringify(OG_KNOWLEDGE.networks, null, 2)}\n\nSDKs:\n${JSON.stringify(OG_KNOWLEDGE.sdks, null, 2)}\n`;
+  d += `\n${hr}\nNOTES\n${hr}\n${OG_KNOWLEDGE.importantNotes.join("\n")}\n`;
+  return d;
 }
 
 // ─── Feature detector ─────────────────────────────────────────────────────────
 
 function detectFeatures(idea: string): string[] {
-  const lower = idea.toLowerCase();
-  const features: string[] = [];
-  if (/storage|upload|file|ipfs|decentralized storage|store|save|blob|media|image|video|document|photo/.test(lower)) features.push("storage");
-  if (/ai|compute|inference|chatbot|chat|gpt|llm|model|text.to.image|speech|whisper|generate|predict|assistant/.test(lower)) features.push("compute");
-  if (/nft|token|erc|contract|mint|deploy|smart contract|solidity|erc20|erc721|marketplace|coin/.test(lower)) features.push("chain");
-  if (/inft|intelligent nft|ai agent nft|erc.7857|agent nft/.test(lower)) features.push("infts");
-  if (/da|data availability|rollup|op.stack|arbitrum/.test(lower)) features.push("da");
-  if (features.length === 0) features.push("storage", "compute");
-  return features;
+  const s = idea.toLowerCase();
+  const f: string[] = [];
+  if (/storage|upload|file|save|blob|media|image|video|document|photo|ipfs|decentralized storage/.test(s)) f.push("storage");
+  if (/ai|compute|inference|chatbot|chat|gpt|llm|model|text.to.image|speech|whisper|generate|predict|assistant/.test(s)) f.push("compute");
+  if (/nft|token|erc|contract|mint|deploy|smart contract|solidity|erc20|erc721|marketplace|coin/.test(s)) f.push("chain");
+  if (/inft|intelligent nft|ai agent nft|erc.7857|agent nft/.test(s)) f.push("infts");
+  if (/\bda\b|data availability|rollup|op.stack|arbitrum/.test(s)) f.push("da");
+  return f.length ? f : ["storage", "compute"];
 }
 
-// ─── File content generators ──────────────────────────────────────────────────
+// ─── Generated file content ───────────────────────────────────────────────────
 
 function genPackageJson(name: string, features: string[], framework: string): string {
   const deps: Record<string, string> = { ethers: "^6.13.4", dotenv: "^16.4.0" };
-  const devDeps: Record<string, string> = { typescript: "^5.7.2", "@types/node": "^22.0.0" };
+  const dev: Record<string, string> = { typescript: "^5.7.2", "@types/node": "^22.0.0" };
   if (features.includes("storage")) deps["@0gfoundation/0g-ts-sdk"] = "latest";
   if (features.includes("compute")) { deps["@0glabs/0g-serving-broker"] = "latest"; deps["openai"] = "^4.0.0"; }
   if (features.includes("chain") || features.includes("infts")) {
-    devDeps["hardhat"] = "^2.22.0";
-    devDeps["@nomicfoundation/hardhat-toolbox"] = "^5.0.0";
-    devDeps["@openzeppelin/contracts"] = "^5.0.0";
+    dev["hardhat"] = "^2.22.0";
+    dev["@nomicfoundation/hardhat-toolbox"] = "^5.0.0";
+    dev["@openzeppelin/contracts"] = "^5.0.0";
   }
-  if (framework === "nextjs") {
-    deps["next"] = "^15.0.0"; deps["react"] = "^19.0.0"; deps["react-dom"] = "^19.0.0";
-    devDeps["@types/react"] = "^19.0.0";
-  }
+  if (framework === "nextjs") { deps["next"] = "^15.0.0"; deps["react"] = "^19.0.0"; deps["react-dom"] = "^19.0.0"; dev["@types/react"] = "^19.0.0"; }
   if (framework === "express") deps["express"] = "^4.21.0";
   const scripts: Record<string, string> = framework === "nextjs"
     ? { dev: "next dev", build: "next build", start: "next start" }
-    : framework === "express"
-    ? { dev: "ts-node src/index.ts", build: "tsc", start: "node dist/index.js" }
     : { deploy: "npx hardhat run scripts/deploy.ts --network 0g-testnet", test: "npx hardhat test" };
-  return JSON.stringify({ name, version: "0.1.0", private: true, scripts, dependencies: deps, devDependencies: devDeps }, null, 2);
+  return JSON.stringify({ name, version: "0.1.0", private: true, scripts, dependencies: deps, devDependencies: dev }, null, 2);
 }
 
 function genEnv(features: string[]): string {
-  let env = `# 0G Network — export your private key from MetaMask
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE
-
-# 0G Testnet (Galileo) — ready to use, no changes needed
-RPC_URL=https://evmrpc-testnet.0g.ai
-CHAIN_ID=16602
-`;
-  if (features.includes("storage")) {
-    env += `
-# 0G Storage Public Indexer
-INDEXER_RPC=https://indexer-storage-testnet-turbo.0g.ai
-# Mainnet: INDEXER_RPC=https://indexer-storage-turbo.0g.ai
-`;
-  }
-  if (features.includes("compute")) {
-    env += `
-# 0G Compute — find providers at https://compute-marketplace.0g.ai/inference
-COMPUTE_PROVIDER_ADDRESS=0xYOUR_PROVIDER_ADDRESS
-`;
-  }
-  env += `
-# Get free testnet tokens: https://faucet.0g.ai
-`;
-  return env;
+  return [
+    "# ─── 0G Network ─────────────────────────────────────────",
+    "# Get your private key: MetaMask → Account → 3-dot menu → Account Details → Export Private Key",
+    "PRIVATE_KEY=0xYOUR_PRIVATE_KEY_HERE",
+    "",
+    "# Testnet (Galileo) — ready to use",
+    "RPC_URL=https://evmrpc-testnet.0g.ai",
+    "CHAIN_ID=16602",
+    "",
+    ...(features.includes("storage") ? [
+      "# 0G Storage public indexer",
+      "INDEXER_RPC=https://indexer-storage-testnet-turbo.0g.ai",
+      "# Mainnet: INDEXER_RPC=https://indexer-storage-turbo.0g.ai",
+      "",
+    ] : []),
+    ...(features.includes("compute") ? [
+      "# 0G Compute — browse providers at https://compute-marketplace.0g.ai/inference",
+      "COMPUTE_PROVIDER_ADDRESS=0xYOUR_PROVIDER_ADDRESS",
+      "",
+    ] : []),
+    "# Get free testnet tokens: https://faucet.0g.ai (0.1 0G/day)",
+  ].join("\n");
 }
 
-function genNextConfig(): string {
-  return `/** @type {import('next').NextConfig} */
-const nextConfig = {};
-export default nextConfig;
-`;
-}
-
-function genTsConfig(): string {
-  return JSON.stringify({
-    compilerOptions: {
-      target: "ES2017", lib: ["dom", "dom.iterable", "esnext"],
-      allowJs: true, skipLibCheck: true, strict: true,
-      noEmit: true, esModuleInterop: true, module: "esnext",
-      moduleResolution: "bundler", resolveJsonModule: true,
-      isolatedModules: true, jsx: "preserve", incremental: true,
-      paths: { "@/*": ["./*"] },
-    },
-    include: ["**/*.ts", "**/*.tsx"],
-    exclude: ["node_modules"],
-  }, null, 2);
-}
-
-function genHardhatConfig(): string {
-  return `import { HardhatUserConfig } from "hardhat/config";
-import "@nomicfoundation/hardhat-toolbox";
-import * as dotenv from "dotenv";
-dotenv.config();
-
-const config: HardhatUserConfig = {
-  solidity: {
-    version: "0.8.19",
-    settings: {
-      evmVersion: "cancun", // REQUIRED for 0G Chain
-      optimizer: { enabled: true, runs: 200 },
-    },
-  },
-  networks: {
-    "0g-testnet": {
-      url: "https://evmrpc-testnet.0g.ai",
-      chainId: 16602,
-      accounts: [process.env.PRIVATE_KEY!],
-    },
-    "0g-mainnet": {
-      url: "https://evmrpc.0g.ai",
-      chainId: 16661,
-      accounts: [process.env.PRIVATE_KEY!],
-    },
-  },
-  etherscan: {
-    apiKey: { "0g-testnet": "placeholder" },
-    customChains: [{
-      network: "0g-testnet", chainId: 16602,
-      urls: {
-        apiURL: "https://chainscan-galileo.0g.ai/open/api",
-        browserURL: "https://chainscan-galileo.0g.ai",
-      },
-    }],
-  },
-};
-
-export default config;
-`;
-}
-
+// Storage lib — uses browser subpath for Next.js client components
 function genStorageLib(): string {
-  return `import { ZgFile, Indexer } from "@0gfoundation/0g-ts-sdk";
+  return `// 0G Storage helper — browser-compatible
+// Uses @0gfoundation/0g-ts-sdk/browser for client-side uploads
+import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser";
 import { ethers } from "ethers";
 
-const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL || "https://evmrpc-testnet.0g.ai";
-const INDEXER_RPC = process.env.NEXT_PUBLIC_INDEXER_RPC || "https://indexer-storage-testnet-turbo.0g.ai";
+const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL ?? "https://evmrpc-testnet.0g.ai";
+const INDEXER_RPC = process.env.NEXT_PUBLIC_INDEXER_RPC ?? "https://indexer-storage-testnet-turbo.0g.ai";
 
 export function getIndexer() {
   return new Indexer(INDEXER_RPC);
@@ -211,56 +156,60 @@ export async function uploadFile(file: File, privateKey: string) {
   const signer = await getSigner(privateKey);
   const indexer = getIndexer();
 
-  // Convert browser File to ZgFile via ArrayBuffer
-  const buffer = await file.arrayBuffer();
-  const uint8 = new Uint8Array(buffer);
-  const zgFile = await ZgFile.fromBuffer(uint8, file.name);
-
-  const [tree, treeErr] = await zgFile.merkleTree();
-  if (treeErr) throw new Error(\`Merkle tree error: \${treeErr}\`);
+  // ZgBlob wraps a browser File/Blob
+  const zgBlob = new ZgBlob([file], file.name);
+  const [tree, treeErr] = await zgBlob.merkleTree();
+  if (treeErr) throw new Error(\`Merkle tree: \${treeErr}\`);
 
   const rootHash = tree?.rootHash() ?? "";
-  const [tx, uploadErr] = await indexer.upload(zgFile, RPC_URL, signer);
-  if (uploadErr) throw new Error(\`Upload error: \${uploadErr}\`);
+  const [tx, uploadErr] = await indexer.upload(zgBlob, RPC_URL, signer);
+  if (uploadErr) throw new Error(\`Upload: \${uploadErr}\`);
 
-  await zgFile.close();
-  return { rootHash, txHash: tx };
+  return { rootHash, txHash: String(tx) };
 }
 
 export async function downloadFile(rootHash: string, outputPath: string) {
   const indexer = getIndexer();
   const err = await indexer.download(rootHash, outputPath, true);
-  if (err) throw new Error(\`Download error: \${err}\`);
+  if (err) throw new Error(\`Download: \${err}\`);
 }
 `;
 }
 
 function genComputeLib(): string {
-  return `import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
+  return `// 0G Compute helper — connects MetaMask and calls decentralized AI
+import { createZGComputeNetworkBroker } from "@0glabs/0g-serving-broker";
 import { BrowserProvider } from "ethers";
 import OpenAI from "openai";
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+declare const window: any;
+
 export async function getBroker() {
-  if (!window.ethereum) throw new Error("MetaMask not found — install at https://metamask.io");
+  if (typeof window === "undefined" || !window.ethereum)
+    throw new Error("MetaMask not found — install at https://metamask.io");
   const provider = new BrowserProvider(window.ethereum);
   const signer = await provider.getSigner();
   return createZGComputeNetworkBroker(signer);
 }
 
-export async function listProviders() {
+export type Provider = { provider: string; model: string; url: string; inputPrice: string; verifiability: string };
+
+export async function listProviders(): Promise<Provider[]> {
   const broker = await getBroker();
-  return broker.inference.listService();
+  return broker.inference.listService() as Promise<Provider[]>;
 }
 
-export async function chat(providerAddress: string, userMessage: string) {
+export async function chat(providerAddress: string, userMessage: string): Promise<string> {
   const broker = await getBroker();
   const { endpoint, model } = await broker.inference.getServiceMetadata(providerAddress);
+  // Headers are single-use — generate fresh for every request
   const headers = await broker.inference.getRequestHeaders(providerAddress, userMessage);
 
   const client = new OpenAI({
     baseURL: endpoint + "/v1/proxy",
     apiKey: "placeholder",
-    defaultHeaders: headers,
+    defaultHeaders: headers as Record<string, string>,
     dangerouslyAllowBrowser: true,
   });
 
@@ -269,8 +218,9 @@ export async function chat(providerAddress: string, userMessage: string) {
     messages: [{ role: "user", content: userMessage }],
   });
 
+  // Required: process response for billing
   await broker.inference.processResponse(providerAddress, completion, userMessage);
-  return completion.choices[0].message.content ?? "";
+  return completion.choices[0]?.message?.content ?? "";
 }
 `;
 }
@@ -280,80 +230,71 @@ function genStoragePage(idea: string): string {
 import { useState, useRef } from "react";
 import { uploadFile, downloadFile } from "@/lib/storage";
 
-// ${idea} — Built with Zaxxie + 0G Storage
+// ${idea}
+// Built with Zaxxie — https://zaxxie.vercel.app
 
 export default function Home() {
-  const [privateKey, setPrivateKey] = useState("");
+  const [key, setKey] = useState("");
   const [rootHash, setRootHash] = useState("");
-  const [downloadHash, setDownloadHash] = useState("");
+  const [dlHash, setDlHash] = useState("");
   const [status, setStatus] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function handleUpload() {
     const file = fileRef.current?.files?.[0];
     if (!file) return setStatus("Select a file first.");
-    if (!privateKey) return setStatus("Enter your private key.");
-    setLoading(true);
+    if (!key) return setStatus("Enter your private key.");
+    setBusy(true);
     try {
       setStatus("Uploading to 0G decentralized storage...");
-      const result = await uploadFile(file, privateKey);
-      setRootHash(result.rootHash);
-      setStatus("✅ Uploaded! Save your root hash to retrieve this file later.");
-    } catch (e: unknown) {
-      setStatus("❌ " + (e as Error).message);
-    } finally { setLoading(false); }
+      const r = await uploadFile(file, key);
+      setRootHash(r.rootHash);
+      setStatus("✅ Uploaded! Save the root hash below — you need it to retrieve the file.");
+    } catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
   async function handleDownload() {
-    if (!downloadHash) return setStatus("Enter a root hash.");
-    setLoading(true);
+    if (!dlHash) return setStatus("Enter a root hash to download.");
+    setBusy(true);
     try {
-      setStatus("Downloading from 0G storage...");
-      await downloadFile(downloadHash, "./download");
-      setStatus("✅ Downloaded!");
-    } catch (e: unknown) {
-      setStatus("❌ " + (e as Error).message);
-    } finally { setLoading(false); }
+      setStatus("Downloading from 0G...");
+      await downloadFile(dlHash, "./download");
+      setStatus("✅ Downloaded successfully!");
+    } catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
+  const inp = { width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", boxSizing: "border-box" as const, marginBottom: 12 };
+  const btn = (bg: string) => ({ background: bg, color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", opacity: busy ? 0.6 : 1 });
+
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 560, margin: "60px auto", padding: "0 20px" }}>
+    <main style={{ fontFamily: "system-ui", maxWidth: 540, margin: "60px auto", padding: "0 20px" }}>
       <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G Storage App</h1>
-      <p style={{ color: "#666", marginBottom: 32 }}>${idea}</p>
-
-      <div style={{ background: "#fff8e1", border: "1px solid #fcd34d", borderRadius: 8, padding: 12, marginBottom: 24, fontSize: 13 }}>
-        ⚠️ Demo only — don't paste real private keys in production. Use a wallet connector instead.
+      <p style={{ color: "#666", marginBottom: 28 }}>${idea}</p>
+      <div style={{ background: "#fff8e1", borderRadius: 8, padding: 12, marginBottom: 24, fontSize: 13 }}>
+        ⚠️ Demo only — use a wallet connector (not raw private key) in production.
       </div>
-
-      <label style={{ display: "block", fontWeight: 600, marginBottom: 4 }}>Private Key</label>
-      <input type="password" value={privateKey} onChange={e => setPrivateKey(e.target.value)}
-        placeholder="0x..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 20, boxSizing: "border-box" }} />
-
-      <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>Upload a File</label>
+      <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Private Key (0x...)</label>
+      <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..." style={inp} />
+      <label style={{ fontWeight: 600, display: "block", marginBottom: 6 }}>File to Upload</label>
       <input type="file" ref={fileRef} style={{ display: "block", marginBottom: 10 }} />
-      <button onClick={handleUpload} disabled={loading}
-        style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", marginBottom: 24 }}>
-        {loading ? "Uploading..." : "Upload to 0G"}
+      <button onClick={handleUpload} disabled={busy} style={btn("#6C3CE1")}>
+        {busy ? "Working..." : "Upload to 0G Storage"}
       </button>
-
       {rootHash && (
-        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 14, marginBottom: 24 }}>
+        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 14, margin: "16px 0" }}>
           <strong>Root Hash — save this!</strong>
-          <code style={{ display: "block", wordBreak: "break-all", marginTop: 6, fontSize: 12 }}>{rootHash}</code>
+          <code style={{ display: "block", wordBreak: "break-all", fontSize: 12, marginTop: 6 }}>{rootHash}</code>
         </div>
       )}
-
-      <label style={{ display: "block", fontWeight: 600, marginBottom: 4 }}>Download by Root Hash</label>
-      <input value={downloadHash} onChange={e => setDownloadHash(e.target.value)}
-        placeholder="0x..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 10, boxSizing: "border-box" }} />
-      <button onClick={handleDownload} disabled={loading}
-        style={{ background: "#1e1e2e", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer" }}>
-        {loading ? "Downloading..." : "Download from 0G"}
+      <label style={{ fontWeight: 600, display: "block", marginBottom: 4, marginTop: 16 }}>Download by Root Hash</label>
+      <input value={dlHash} onChange={e => setDlHash(e.target.value)} placeholder="0x..." style={inp} />
+      <button onClick={handleDownload} disabled={busy} style={btn("#1e1e2e")}>
+        {busy ? "Working..." : "Download from 0G"}
       </button>
-
-      {status && <p style={{ marginTop: 20, fontSize: 14, color: "#444" }}>{status}</p>}
-
+      {status && <p style={{ marginTop: 16, fontSize: 14 }}>{status}</p>}
       <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
         Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
         <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
@@ -367,81 +308,66 @@ export default function Home() {
 function genComputePage(idea: string): string {
   return `"use client";
 import { useState } from "react";
-import { listProviders, chat } from "@/lib/compute";
+import { listProviders, chat, type Provider } from "@/lib/compute";
 
-// ${idea} — Built with Zaxxie + 0G Compute
-
-type Provider = { provider: string; model: string; inputPrice: string };
+// ${idea}
+// Built with Zaxxie — https://zaxxie.vercel.app
 
 export default function Home() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [selected, setSelected] = useState("");
-  const [message, setMessage] = useState("");
-  const [response, setResponse] = useState("");
+  const [msg, setMsg] = useState("");
+  const [reply, setReply] = useState("");
   const [status, setStatus] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   async function connect() {
-    setLoading(true);
-    try {
-      setStatus("Connecting wallet and loading 0G AI providers...");
-      setProviders(await listProviders());
-      setStatus("");
-    } catch (e: unknown) { setStatus("❌ " + (e as Error).message); }
-    finally { setLoading(false); }
+    setBusy(true);
+    try { setProviders(await listProviders()); setStatus(""); }
+    catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
   async function send() {
-    if (!selected || !message) return setStatus("Choose a provider and type a message.");
-    setLoading(true);
-    try {
-      setStatus("Sending to decentralized AI...");
-      setResponse(await chat(selected, message));
-      setStatus("");
-    } catch (e: unknown) { setStatus("❌ " + (e as Error).message); }
-    finally { setLoading(false); }
+    if (!selected || !msg) return setStatus("Choose a provider and type a message.");
+    setBusy(true);
+    try { setReply(await chat(selected, msg)); setStatus(""); }
+    catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
   return (
     <main style={{ fontFamily: "system-ui", maxWidth: 580, margin: "60px auto", padding: "0 20px" }}>
       <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G AI App</h1>
-      <p style={{ color: "#666", marginBottom: 32 }}>${idea}</p>
-
-      <button onClick={connect} disabled={loading}
-        style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "11px 24px", borderRadius: 6, cursor: "pointer", marginBottom: 24, fontWeight: 600 }}>
-        {loading ? "Connecting..." : "Connect Wallet & Load AI Providers"}
+      <p style={{ color: "#666", marginBottom: 28 }}>${idea}</p>
+      <button onClick={connect} disabled={busy}
+        style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "11px 24px", borderRadius: 6, cursor: "pointer", fontWeight: 600, marginBottom: 20 }}>
+        {busy ? "Loading..." : "Connect Wallet & Load AI Providers"}
       </button>
-
       {providers.length > 0 && (
         <>
-          <label style={{ display: "block", fontWeight: 600, marginBottom: 4 }}>Choose AI Model</label>
+          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>AI Model</label>
           <select value={selected} onChange={e => setSelected(e.target.value)}
-            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 16 }}>
-            <option value="">-- Select model --</option>
-            {providers.map(p => (
-              <option key={p.provider} value={p.provider}>{p.model} — {p.inputPrice}</option>
-            ))}
+            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 14 }}>
+            <option value="">-- Choose model --</option>
+            {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} — {p.inputPrice}</option>)}
           </select>
         </>
       )}
-
-      <label style={{ display: "block", fontWeight: 600, marginBottom: 4 }}>Your Message</label>
-      <textarea value={message} onChange={e => setMessage(e.target.value)} rows={4}
-        placeholder="Ask anything..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 10, boxSizing: "border-box" }} />
-      <button onClick={send} disabled={loading}
+      <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Message</label>
+      <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4}
+        placeholder="Ask anything..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 8, boxSizing: "border-box" }} />
+      <button onClick={send} disabled={busy}
         style={{ background: "#1e1e2e", color: "#fff", border: "none", padding: "11px 24px", borderRadius: 6, cursor: "pointer" }}>
-        {loading ? "Thinking..." : "Send"}
+        {busy ? "Thinking..." : "Send to Decentralized AI"}
       </button>
-
-      {response && (
-        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 16, marginTop: 20 }}>
+      {reply && (
+        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 16, marginTop: 16 }}>
           <strong>AI Response</strong>
-          <p style={{ margin: "8px 0 0", lineHeight: 1.7 }}>{response}</p>
+          <p style={{ margin: "8px 0 0", lineHeight: 1.7 }}>{reply}</p>
         </div>
       )}
-
-      {status && <p style={{ marginTop: 16, fontSize: 14, color: "#555" }}>{status}</p>}
-
+      {status && <p style={{ marginTop: 14, fontSize: 14 }}>{status}</p>}
       <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
         Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
         <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
@@ -456,58 +382,54 @@ function genFullPage(idea: string): string {
   return `"use client";
 import { useState, useRef } from "react";
 import { uploadFile } from "@/lib/storage";
-import { listProviders, chat } from "@/lib/compute";
+import { listProviders, chat, type Provider } from "@/lib/compute";
 
-// ${idea} — Built with Zaxxie + 0G Storage + Compute
+// ${idea}
+// Built with Zaxxie — https://zaxxie.vercel.app
 
-type Provider = { provider: string; model: string; inputPrice: string };
 type Tab = "storage" | "ai";
 
 export default function Home() {
   const [tab, setTab] = useState<Tab>("storage");
-  const [privateKey, setPrivateKey] = useState("");
+  const [key, setKey] = useState("");
   const [rootHash, setRootHash] = useState("");
   const [providers, setProviders] = useState<Provider[]>([]);
   const [selected, setSelected] = useState("");
-  const [message, setMessage] = useState("");
-  const [aiResponse, setAiResponse] = useState("");
+  const [msg, setMsg] = useState("");
+  const [aiReply, setAiReply] = useState("");
   const [status, setStatus] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function handleUpload() {
     const file = fileRef.current?.files?.[0];
-    if (!file || !privateKey) return setStatus("Select a file and enter your private key.");
-    setLoading(true);
+    if (!file || !key) return setStatus("Select a file and enter your private key.");
+    setBusy(true);
     try {
-      setStatus("Uploading to 0G...");
-      const result = await uploadFile(file, privateKey);
-      setRootHash(result.rootHash);
+      setStatus("Uploading...");
+      const r = await uploadFile(file, key);
+      setRootHash(r.rootHash);
       setStatus("✅ Uploaded!");
-    } catch (e: unknown) { setStatus("❌ " + (e as Error).message); }
-    finally { setLoading(false); }
+    } catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
   async function handleConnect() {
-    setLoading(true);
-    try {
-      setProviders(await listProviders());
-      setStatus("");
-    } catch (e: unknown) { setStatus("❌ " + (e as Error).message); }
-    finally { setLoading(false); }
+    setBusy(true);
+    try { setProviders(await listProviders()); setStatus(""); }
+    catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
   async function handleChat() {
-    if (!selected || !message) return setStatus("Choose a provider and type something.");
-    setLoading(true);
-    try {
-      setAiResponse(await chat(selected, message));
-      setStatus("");
-    } catch (e: unknown) { setStatus("❌ " + (e as Error).message); }
-    finally { setLoading(false); }
+    if (!selected || !msg) return setStatus("Choose a provider and type something.");
+    setBusy(true);
+    try { setAiReply(await chat(selected, msg)); setStatus(""); }
+    catch (e) { setStatus("❌ " + (e as Error).message); }
+    finally { setBusy(false); }
   }
 
-  const btn = (t: Tab) => ({
+  const tabBtn = (t: Tab) => ({
     padding: "8px 22px", border: "none", borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 14,
     background: tab === t ? "#6C3CE1" : "#f0f0f0", color: tab === t ? "#fff" : "#444",
   } as const);
@@ -515,22 +437,20 @@ export default function Home() {
   return (
     <main style={{ fontFamily: "system-ui", maxWidth: 600, margin: "60px auto", padding: "0 20px" }}>
       <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G dApp</h1>
-      <p style={{ color: "#666", marginBottom: 28 }}>${idea}</p>
-
-      <div style={{ display: "flex", gap: 8, marginBottom: 28 }}>
-        <button style={btn("storage")} onClick={() => setTab("storage")}>Storage</button>
-        <button style={btn("ai")} onClick={() => setTab("ai")}>AI Inference</button>
+      <p style={{ color: "#666", marginBottom: 24 }}>${idea}</p>
+      <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
+        <button style={tabBtn("storage")} onClick={() => setTab("storage")}>Storage</button>
+        <button style={tabBtn("ai")} onClick={() => setTab("ai")}>AI Inference</button>
       </div>
-
       {tab === "storage" && (
         <div>
-          <label style={{ display: "block", fontWeight: 600, marginBottom: 4 }}>Private Key</label>
-          <input type="password" value={privateKey} onChange={e => setPrivateKey(e.target.value)}
-            placeholder="0x..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 14, boxSizing: "border-box" }} />
+          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Private Key</label>
+          <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..."
+            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 12, boxSizing: "border-box" }} />
           <input type="file" ref={fileRef} style={{ display: "block", marginBottom: 10 }} />
-          <button onClick={handleUpload} disabled={loading}
+          <button onClick={handleUpload} disabled={busy}
             style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer" }}>
-            {loading ? "Uploading..." : "Upload to 0G Storage"}
+            {busy ? "Uploading..." : "Upload to 0G"}
           </button>
           {rootHash && (
             <div style={{ background: "#f0fdf4", borderRadius: 8, padding: 12, marginTop: 14 }}>
@@ -540,11 +460,10 @@ export default function Home() {
           )}
         </div>
       )}
-
       {tab === "ai" && (
         <div>
-          <button onClick={handleConnect} disabled={loading}
-            style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", marginBottom: 16 }}>
+          <button onClick={handleConnect} disabled={busy}
+            style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", marginBottom: 14 }}>
             Connect Wallet & Load Providers
           </button>
           {providers.length > 0 && (
@@ -554,22 +473,20 @@ export default function Home() {
               {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} — {p.inputPrice}</option>)}
             </select>
           )}
-          <textarea value={message} onChange={e => setMessage(e.target.value)} rows={4}
-            placeholder="Ask anything..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 8, boxSizing: "border-box" }} />
-          <button onClick={handleChat} disabled={loading}
+          <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4} placeholder="Ask anything..."
+            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 8, boxSizing: "border-box" }} />
+          <button onClick={handleChat} disabled={busy}
             style={{ background: "#1e1e2e", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer" }}>
-            {loading ? "Thinking..." : "Ask AI"}
+            {busy ? "Thinking..." : "Ask AI"}
           </button>
-          {aiResponse && (
+          {aiReply && (
             <div style={{ background: "#f0fdf4", borderRadius: 8, padding: 14, marginTop: 14 }}>
-              <p style={{ margin: 0, lineHeight: 1.7 }}>{aiResponse}</p>
+              <p style={{ margin: 0, lineHeight: 1.7 }}>{aiReply}</p>
             </div>
           )}
         </div>
       )}
-
-      {status && <p style={{ marginTop: 16, fontSize: 14, color: "#555" }}>{status}</p>}
-
+      {status && <p style={{ marginTop: 14, fontSize: 14 }}>{status}</p>}
       <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
         Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
         <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
@@ -583,7 +500,7 @@ export default function Home() {
 function genContract(name: string): string {
   return `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
-// Deploy on 0G Chain — ALWAYS compile with evmVersion: "cancun"
+// 0G Chain — MUST compile with evmVersion: "cancun"
 
 contract ${name} {
     address public owner;
@@ -598,7 +515,10 @@ contract ${name} {
         balances[msg.sender] = _supply;
     }
 
-    modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
 
     function transfer(address to, uint256 amount) public returns (bool) {
         require(balances[msg.sender] >= amount, "Insufficient balance");
@@ -620,35 +540,62 @@ contract ${name} {
 `;
 }
 
-function genDeploy(contractName: string): string {
+function genDeploy(name: string): string {
   return `import { ethers } from "hardhat";
 
 async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying from:", deployer.address);
+  const bal = await ethers.provider.getBalance(deployer.address);
+  console.log("Balance:", ethers.formatEther(bal), "0G");
 
-  const balance = await ethers.provider.getBalance(deployer.address);
-  console.log("Balance:", ethers.formatEther(balance), "0G");
+  const C = await ethers.getContractFactory("${name}");
+  const c = await C.deploy(1_000_000);
+  await c.waitForDeployment();
 
-  const Contract = await ethers.getContractFactory("${contractName}");
-  const contract = await Contract.deploy(1_000_000);
-  await contract.waitForDeployment();
-
-  const address = await contract.getAddress();
-  console.log("✅ Deployed:", address);
-  console.log("Explorer:", "https://chainscan-galileo.0g.ai/address/" + address);
+  const addr = await c.getAddress();
+  console.log("✅ ${name} deployed:", addr);
+  console.log("Explorer:", "https://chainscan-galileo.0g.ai/address/" + addr);
 }
 
 main().catch(e => { console.error(e); process.exitCode = 1; });
+// npx hardhat run scripts/deploy.ts --network 0g-testnet
 `;
 }
 
-// ─── Structured project builder ───────────────────────────────────────────────
+function genHardhatConfig(): string {
+  return `import { HardhatUserConfig } from "hardhat/config";
+import "@nomicfoundation/hardhat-toolbox";
+import * as dotenv from "dotenv";
+dotenv.config();
 
-interface ProjectFile {
-  path: string;
-  content: string;
+const config: HardhatUserConfig = {
+  solidity: {
+    version: "0.8.19",
+    settings: {
+      evmVersion: "cancun", // REQUIRED for 0G Chain — never skip this
+      optimizer: { enabled: true, runs: 200 },
+    },
+  },
+  networks: {
+    "0g-testnet": { url: "https://evmrpc-testnet.0g.ai", chainId: 16602, accounts: [process.env.PRIVATE_KEY!] },
+    "0g-mainnet": { url: "https://evmrpc.0g.ai", chainId: 16661, accounts: [process.env.PRIVATE_KEY!] },
+  },
+  etherscan: {
+    apiKey: { "0g-testnet": "placeholder" },
+    customChains: [{
+      network: "0g-testnet", chainId: 16602,
+      urls: { apiURL: "https://chainscan-galileo.0g.ai/open/api", browserURL: "https://chainscan-galileo.0g.ai" },
+    }],
+  },
+};
+export default config;
+`;
 }
+
+// ─── Project builder ──────────────────────────────────────────────────────────
+
+interface ProjectFile { path: string; content: string; }
 
 interface BuildResult {
   projectName: string;
@@ -656,53 +603,34 @@ interface BuildResult {
   features: string[];
   framework: string;
   files: ProjectFile[];
-  setup: {
-    createProject: string;
-    installDeps: string;
-    envSetup: string;
-    run: string;
-  };
+  setup: { createProject: string; installDeps: string; envSetup: string; run: string; };
   steps: string[];
   links: Record<string, string>;
-  important: string[];
+  warnings: string[];
 }
 
 function buildProject(name: string, idea: string, features: string[], framework: string): BuildResult {
+  const safe = name.replace(/[^a-zA-Z0-9-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "my-0g-dapp";
+  const contractName = safe.replace(/-/g, "_").replace(/^[0-9]/, "C").replace(/_+/g, "_");
   const files: ProjectFile[] = [];
-  const safeName = name.replace(/[^a-zA-Z0-9-_]/g, "-").slice(0, 40);
-  const contractName = safeName.replace(/-/g, "_").replace(/^[0-9]/, "C") || "MyContract";
 
-  // Always include
-  files.push({ path: "package.json", content: genPackageJson(safeName, features, framework) });
+  // Core files
+  files.push({ path: "package.json", content: genPackageJson(safe, features, framework) });
   files.push({ path: ".env.example", content: genEnv(features) });
   files.push({ path: ".gitignore", content: "node_modules/\n.next/\n.env\n.env.local\ndist/\nartifacts/\ncache/\n" });
 
   if (framework === "nextjs") {
-    files.push({ path: "next.config.mjs", content: genNextConfig() });
-    files.push({ path: "tsconfig.json", content: genTsConfig() });
+    files.push({ path: "next.config.mjs", content: `/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nexport default nextConfig;\n` });
+    files.push({ path: "tsconfig.json", content: JSON.stringify({ compilerOptions: { target: "ES2017", lib: ["dom","dom.iterable","esnext"], allowJs: true, skipLibCheck: true, strict: true, noEmit: true, esModuleInterop: true, module: "esnext", moduleResolution: "bundler", resolveJsonModule: true, isolatedModules: true, jsx: "preserve", incremental: true, paths: { "@/*": ["./*"] } }, include: ["**/*.ts","**/*.tsx"], exclude: ["node_modules"] }, null, 2) });
+    files.push({ path: "app/layout.tsx", content: `export const metadata = { title: "${safe}", description: "${idea.slice(0,100)}" };\nexport default function Layout({ children }: { children: React.ReactNode }) {\n  return <html lang="en"><body style={{ margin: 0 }}>{children}</body></html>;\n}\n` });
 
-    // Page based on features
-    if (features.includes("storage") && features.includes("compute")) {
-      files.push({ path: "app/page.tsx", content: genFullPage(idea) });
-    } else if (features.includes("storage")) {
-      files.push({ path: "app/page.tsx", content: genStoragePage(idea) });
-    } else if (features.includes("compute")) {
-      files.push({ path: "app/page.tsx", content: genComputePage(idea) });
-    } else {
-      files.push({ path: "app/page.tsx", content: genStoragePage(idea) });
-    }
+    const hasStorage = features.includes("storage");
+    const hasCompute = features.includes("compute");
+    const page = hasStorage && hasCompute ? genFullPage(idea) : hasCompute ? genComputePage(idea) : genStoragePage(idea);
+    files.push({ path: "app/page.tsx", content: page });
 
-    files.push({
-      path: "app/layout.tsx",
-      content: `export const metadata = { title: "${safeName}", description: "${idea}" };\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html lang="en"><body style={{ margin: 0 }}>{children}</body></html>;\n}\n`,
-    });
-
-    if (features.includes("storage")) {
-      files.push({ path: "lib/storage.ts", content: genStorageLib() });
-    }
-    if (features.includes("compute")) {
-      files.push({ path: "lib/compute.ts", content: genComputeLib() });
-    }
+    if (hasStorage) files.push({ path: "lib/storage.ts", content: genStorageLib() });
+    if (hasCompute) files.push({ path: "lib/compute.ts", content: genComputeLib() });
   }
 
   if (features.includes("chain") || features.includes("infts")) {
@@ -711,45 +639,43 @@ function buildProject(name: string, idea: string, features: string[], framework:
     files.push({ path: "scripts/deploy.ts", content: genDeploy(contractName) });
   }
 
-  // Dep install command
-  const pkgDeps = ["ethers", "dotenv"];
-  if (features.includes("storage")) pkgDeps.push("@0gfoundation/0g-ts-sdk");
-  if (features.includes("compute")) pkgDeps.push("@0glabs/0g-serving-broker", "openai");
-  if (framework === "nextjs") pkgDeps.push("next", "react", "react-dom");
+  // Build install command
+  const pkgs = ["ethers", "dotenv"];
+  if (features.includes("storage")) pkgs.push("@0gfoundation/0g-ts-sdk");
+  if (features.includes("compute")) pkgs.push("@0glabs/0g-serving-broker", "openai");
+  if (framework === "nextjs") pkgs.push("next", "react", "react-dom");
 
-  const devDeps = ["typescript", "@types/node"];
-  if (features.includes("chain") || features.includes("infts")) devDeps.push("hardhat", "@nomicfoundation/hardhat-toolbox", "@openzeppelin/contracts");
-  if (framework === "nextjs") devDeps.push("@types/react");
+  const devPkgs = ["typescript", "@types/node"];
+  if (framework === "nextjs") devPkgs.push("@types/react");
+  if (features.includes("chain") || features.includes("infts")) devPkgs.push("hardhat", "@nomicfoundation/hardhat-toolbox", "@openzeppelin/contracts");
 
-  const installCmd = `npm install ${pkgDeps.join(" ")}\nnpm install --save-dev ${devDeps.join(" ")}`;
-
-  const runCmd = framework === "nextjs" ? "npm run dev  # then open http://localhost:3000"
-    : (features.includes("chain") ? "npx hardhat compile && npx hardhat run scripts/deploy.ts --network 0g-testnet"
-      : "npm run dev");
+  const create = framework === "nextjs"
+    ? `npx create-next-app@latest ${safe} --typescript --app --no-tailwind --import-alias "@/*" --no-src-dir`
+    : `mkdir ${safe} && cd ${safe} && npm init -y`;
 
   return {
-    projectName: safeName,
+    projectName: safe,
     idea,
     features,
     framework,
     files,
     setup: {
-      createProject: framework === "nextjs"
-        ? `npx create-next-app@latest ${safeName} --typescript --app --no-tailwind --import-alias "@/*" --src-dir no`
-        : `mkdir ${safeName} && cd ${safeName} && npm init -y`,
-      installDeps: installCmd,
-      envSetup: "cp .env.example .env\n# Open .env and paste your MetaMask private key\n# MetaMask → Account → 3-dot menu → Account Details → Export Private Key",
-      run: runCmd,
+      createProject: create,
+      installDeps: `npm install ${pkgs.join(" ")}\nnpm install --save-dev ${devPkgs.join(" ")}`,
+      envSetup: "cp .env.example .env\n# Edit .env — paste your MetaMask private key into PRIVATE_KEY",
+      run: framework === "nextjs" ? "npm run dev\n# Open http://localhost:3000"
+        : features.includes("chain") ? "npx hardhat compile\nnpx hardhat run scripts/deploy.ts --network 0g-testnet"
+        : "npm run dev",
     },
     steps: [
-      "1. Install Node.js v18+ from https://nodejs.org if not already installed",
-      "2. Install MetaMask from https://metamask.io if not already installed",
-      `3. Run the createProject command to scaffold the project`,
-      "4. Write all generated files into the project folder",
-      "5. Run the installDeps command",
-      "6. Run the envSetup command and add your private key",
-      "7. Get free testnet tokens at https://faucet.0g.ai (need 0G to pay gas)",
-      "8. Run the run command to start your dApp",
+      "1. Install Node.js 18+ from https://nodejs.org",
+      "2. Install MetaMask from https://metamask.io",
+      "3. Run setup.createProject in your terminal",
+      "4. Copy all generated files into the project folder",
+      "5. Run setup.installDeps",
+      "6. Run setup.envSetup — add your MetaMask private key",
+      "7. Get free testnet tokens at https://faucet.0g.ai (need 0G for gas)",
+      "8. Run setup.run to start your dApp",
     ],
     links: {
       faucet: "https://faucet.0g.ai",
@@ -760,295 +686,458 @@ function buildProject(name: string, idea: string, features: string[], framework:
       builderHub: "https://build.0g.ai",
       discord: "https://discord.gg/0glabs",
     },
-    important: [
-      "ALWAYS use evmVersion: 'cancun' for Solidity compilation on 0G Chain",
-      "ethers is a peer dependency — always install it alongside 0G SDKs",
-      "Storage: always call file.close() after uploading",
-      "Storage: save the root hash — you need it to download your file",
-      "Compute: request headers are single-use — generate new ones per request",
+    warnings: [
+      "ALWAYS set evmVersion: 'cancun' for Solidity on 0G Chain",
+      "ethers must be installed as a peer dep alongside 0G SDKs",
+      "Storage: call file.close() after upload; save the root hash",
+      "Compute: request headers are single-use — call getRequestHeaders() per request",
       "Testnet Chain ID: 16602 | Mainnet Chain ID: 16661",
     ],
   };
 }
 
-// ─── MCP Handler ─────────────────────────────────────────────────────────────
+// ─── MCP handler ─────────────────────────────────────────────────────────────
 
 const handler = createMcpHandler(
   (server) => {
 
-    // ── 1. BUILD — structured output ──────────────────────────────────────────
+    // ══════════════════════════════════════════════════════
+    // TIER 1
+    // ══════════════════════════════════════════════════════
+
+    // 1. BUILD — structured file output
     server.registerTool("zaxxie_build", {
       title: "Build a 0G dApp",
-      description: `THE MAIN TOOL. Call this when the user wants to build anything on 0G. Takes a natural language idea, auto-detects features, and returns a STRUCTURED JSON object with: every file (path + complete content), setup commands, and numbered steps. Claude Code should use the files array to write each file to disk directly. No prior coding knowledge required. Works for storage apps, AI chatbots, smart contracts, NFT marketplaces, full-stack dApps — anything on 0G.`,
+      description: "MAIN TOOL. Takes any plain-English idea, auto-detects 0G features, and returns a structured JSON with every file (path + complete content), install commands, and numbered steps. Claude Code should write each file in the 'files' array directly to disk. Works for storage apps, AI chatbots, smart contracts, NFTs, full-stack dApps — anything on 0G.",
       inputSchema: {
-        idea: z.string().describe("What the user wants to build, in plain English"),
-        projectName: z.string().default("my-0g-dapp").describe("Project folder name — leave blank to auto-generate from idea"),
-        features: z.array(z.enum(["chain", "storage", "compute", "da", "infts"])).optional().describe("0G features to include — omit to auto-detect from idea"),
-        framework: z.enum(["nextjs", "react", "express", "hardhat", "custom"]).default("nextjs").describe("Framework — nextjs recommended for most dApps"),
+        idea: z.string().describe("What to build, in plain English"),
+        projectName: z.string().default("my-0g-dapp").describe("Project folder name — auto-generated from idea if omitted"),
+        features: z.array(z.enum(["chain","storage","compute","da","infts"])).optional().describe("0G features — auto-detected from idea if omitted"),
+        framework: z.enum(["nextjs","react","express","hardhat","custom"]).default("nextjs").describe("Framework"),
       },
     }, async ({ idea, projectName, features, framework }) => {
-      const detectedFeatures = features && features.length > 0 ? features : detectFeatures(idea);
-      const name = projectName !== "my-0g-dapp"
-        ? projectName
-        : idea.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "my-0g-dapp";
-      const result = buildProject(name, idea, detectedFeatures, framework);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      const f = features?.length ? features : detectFeatures(idea);
+      const n = projectName !== "my-0g-dapp" ? projectName
+        : idea.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "my-0g-dapp";
+      return { content: [{ type: "text", text: JSON.stringify(buildProject(n, idea, f, framework), null, 2) }] };
     });
 
-    // ── 2. CHECK WALLET — live balance from 0G RPC ────────────────────────────
+    // 2. CHECK WALLET — live balance
     server.registerTool("zaxxie_check_wallet", {
       title: "Check 0G Wallet",
-      description: "Check any wallet address on 0G — live balance, transaction count, faucet eligibility, and explorer link. Use this when a user wants to verify their wallet has tokens before deploying or uploading.",
+      description: "Live wallet balance and transaction count from the 0G RPC. Returns balance in 0G, faucet links if empty, and explorer URL. Use before deploying or uploading.",
       inputSchema: {
         address: z.string().describe("Wallet address (0x...)"),
-        network: z.enum(["testnet", "mainnet"]).default("testnet").describe("Which network to check"),
+        network: z.enum(["testnet","mainnet"]).default("testnet"),
       },
     }, async ({ address, network }) => {
       try {
-        const [balanceHex, txCountHex] = await Promise.all([
-          rpcCall(network, "eth_getBalance", [address, "latest"]),
-          rpcCall(network, "eth_getTransactionCount", [address, "latest"]),
+        const [balHex, txHex] = await Promise.all([
+          rpc(network, "eth_getBalance", [address, "latest"]) as Promise<string>,
+          rpc(network, "eth_getTransactionCount", [address, "latest"]) as Promise<string>,
         ]);
-
-        const balanceWei = hexToDecimal(balanceHex);
-        const balance = formatBalance(balanceWei);
-        const txCount = parseInt(txCountHex, 16);
-        const hasBalance = balanceWei > BigInt(0);
-        const canDeploy = balanceWei > BigInt(1e15); // ~0.001 0G minimum
-
-        const explorerUrl = `${EXPLORER[network]}/address/${address}`;
-        const chainId = network === "testnet" ? 16602 : 16661;
-        const networkName = network === "testnet" ? "Galileo Testnet" : "Aristotle Mainnet";
-
-        const result = {
-          address,
-          network: networkName,
-          chainId,
-          balance: `${balance} 0G`,
-          balanceWei: balanceWei.toString(),
-          transactionCount: txCount,
-          status: {
-            hasTokens: hasBalance,
-            canDeploy,
-            faucetNeeded: !hasBalance,
-          },
-          explorerUrl,
-          ...(network === "testnet" && !hasBalance ? {
-            getTokens: "https://faucet.0g.ai",
+        const balance = hexToEth(balHex);
+        const txCount = hexToInt(txHex);
+        const wei = BigInt(balHex ?? "0x0");
+        const canDeploy = wei >= BigInt(1e15);
+        return { content: [{ type: "text", text: JSON.stringify({
+          address, network, chainId: CHAIN_ID[network],
+          balance: `${balance} 0G`, txCount,
+          canDeploy, needsTokens: wei === BigInt(0),
+          explorerUrl: `${EXPLORER[network]}/address/${address}`,
+          ...(wei === BigInt(0) && network === "testnet" ? {
+            faucet: "https://faucet.0g.ai",
             googleFaucet: "https://cloud.google.com/application/web3/faucet/0g/galileo",
-            tip: "You need 0G tokens to pay gas. Get 0.1 free at https://faucet.0g.ai",
+            tip: "Get 0.1 free 0G at https://faucet.0g.ai — needed to pay gas fees",
           } : {}),
-        };
-
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e: unknown) {
+        }, null, 2) }] };
+      } catch (e) {
         return { content: [{ type: "text", text: JSON.stringify({ error: (e as Error).message, rpc: RPC[network] }) }] };
       }
     });
 
-    // ── 3. CHECK TX — live transaction status ─────────────────────────────────
+    // 3. CHECK TX — live transaction status
     server.registerTool("zaxxie_check_tx", {
-      title: "Check Transaction Status",
-      description: "Check the status of any transaction on 0G — whether it succeeded, failed, gas used, block number, and explorer link. Use this after a user deploys a contract or uploads to 0G Storage.",
+      title: "Check Transaction",
+      description: "Live transaction status from 0G — confirmed/pending/failed, gas used, block number, contract address if it was a deploy, and explorer link.",
       inputSchema: {
         txHash: z.string().describe("Transaction hash (0x...)"),
-        network: z.enum(["testnet", "mainnet"]).default("testnet").describe("Which network"),
+        network: z.enum(["testnet","mainnet"]).default("testnet"),
       },
     }, async ({ txHash, network }) => {
       try {
         const [receipt, tx] = await Promise.all([
-          rpcCall(network, "eth_getTransactionReceipt", [txHash]),
-          rpcCall(network, "eth_getTransactionByHash", [txHash]),
-        ]);
+          rpc(network, "eth_getTransactionReceipt", [txHash]),
+          rpc(network, "eth_getTransactionByHash", [txHash]),
+        ]) as [Record<string,string> | null, Record<string,string> | null];
 
-        if (!receipt && !tx) {
-          return { content: [{ type: "text", text: JSON.stringify({ txHash, status: "not_found", message: "Transaction not found — check the hash or wait a few seconds if just sent." }) }] };
-        }
-
-        if (!receipt) {
-          return { content: [{ type: "text", text: JSON.stringify({ txHash, status: "pending", message: "Transaction is pending — still being processed by the network.", from: tx?.from, to: tx?.to }) }] };
-        }
+        if (!receipt && !tx)
+          return { content: [{ type: "text", text: JSON.stringify({ txHash, status: "not_found", message: "Not found — check the hash or wait a moment if just sent." }) }] };
+        if (!receipt)
+          return { content: [{ type: "text", text: JSON.stringify({ txHash, status: "pending", from: tx?.from, to: tx?.to, message: "Transaction is pending." }) }] };
 
         const success = receipt.status === "0x1";
-        const gasUsed = parseInt(receipt.gasUsed, 16);
-        const blockNumber = parseInt(receipt.blockNumber, 16);
-        const explorerUrl = `${EXPLORER[network]}/tx/${txHash}`;
-        const contractCreated = receipt.contractAddress
-          ? { contractAddress: receipt.contractAddress, contractExplorer: `${EXPLORER[network]}/address/${receipt.contractAddress}` }
-          : {};
-
-        const result = {
-          txHash,
-          network: network === "testnet" ? "Galileo Testnet" : "Aristotle Mainnet",
-          status: success ? "✅ success" : "❌ failed",
-          blockNumber,
-          gasUsed,
-          from: receipt.from,
-          to: receipt.to,
-          ...contractCreated,
-          explorerUrl,
-          ...(success && receipt.contractAddress
-            ? { message: `Contract deployed at ${receipt.contractAddress}` }
-            : success
-            ? { message: "Transaction confirmed successfully" }
-            : { message: "Transaction failed — check gas or contract logic", tip: "Common causes: insufficient gas, require() revert in contract, wrong EVM version" }),
+        const result: Record<string, unknown> = {
+          txHash, network, status: success ? "✅ confirmed" : "❌ failed",
+          blockNumber: hexToInt(receipt.blockNumber),
+          gasUsed: hexToInt(receipt.gasUsed),
+          from: receipt.from, to: receipt.to,
+          explorerUrl: `${EXPLORER[network]}/tx/${txHash}`,
         };
-
+        if (receipt.contractAddress) {
+          result.contractAddress = receipt.contractAddress;
+          result.contractExplorer = `${EXPLORER[network]}/address/${receipt.contractAddress}`;
+          result.message = `Contract deployed at ${receipt.contractAddress}`;
+        } else {
+          result.message = success ? "Transaction confirmed" : "Transaction failed — check gas or contract logic";
+        }
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-      } catch (e: unknown) {
+      } catch (e) {
         return { content: [{ type: "text", text: JSON.stringify({ error: (e as Error).message }) }] };
       }
     });
 
-    // ── 4. LIVE DOCS — fetch latest from 0G ──────────────────────────────────
+    // 4. LIVE DOCS — fetch from docs.0g.ai
     server.registerTool("zaxxie_live_docs", {
       title: "Fetch Live 0G Docs",
-      description: "Fetch the latest documentation directly from docs.0g.ai and build.0g.ai. Use this when you need the most up-to-date SDK versions, contract addresses, or API changes — in case the cached knowledge is outdated.",
+      description: "Fetch the latest documentation directly from docs.0g.ai. Use when you need up-to-date SDK versions, contract addresses, or API changes. Falls back to cached knowledge on failure.",
       inputSchema: {
-        topic: z.enum(["storage", "compute", "chain", "da", "network", "zero-coding"]).describe("Which part of the docs to fetch"),
+        topic: z.enum(["storage","compute","chain","da","network","zero-coding"]).describe("Topic to fetch"),
       },
     }, async ({ topic }) => {
-      const urlMap: Record<string, string[]> = {
-        storage:      ["https://docs.0g.ai/build-with-0g/storage/sdk"],
-        compute:      ["https://docs.0g.ai/build-with-0g/compute-network/sdk"],
-        chain:        ["https://docs.0g.ai/build-with-0g/chain/deploy-contracts"],
-        da:           ["https://docs.0g.ai/build-with-0g/da/integration"],
-        network:      ["https://docs.0g.ai/build-with-0g/network-endpoints"],
-        "zero-coding": ["https://build.0g.ai/zero-coding/"],
+      const urls: Record<string, string> = {
+        storage:       "https://docs.0g.ai/build-with-0g/storage",
+        compute:       "https://docs.0g.ai/build-with-0g/compute-network/sdk",
+        chain:         "https://docs.0g.ai/build-with-0g/chain",
+        da:            "https://docs.0g.ai/build-with-0g/da",
+        network:       "https://docs.0g.ai/build-with-0g/network-endpoints",
+        "zero-coding": "https://build.0g.ai/zero-coding/",
       };
+      const url = urls[topic];
+      try {
+        const res = await fetch(url, {
+          headers: { "User-Agent": "Zaxxie-MCP/3.0 zaxxie.vercel.app" },
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const html = await res.text();
+        const text = html
+          .replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[\s\S]*?<\/style>/gi, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#\d+;/g, " ")
+          .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, 8000);
+        return { content: [{ type: "text", text: JSON.stringify({ source: url, topic, content: text }, null, 2) }] };
+      } catch (e) {
+        const fallback = buildDocs(topic === "zero-coding" ? "all" : topic);
+        return { content: [{ type: "text", text: JSON.stringify({ source: "cached", topic, fetchError: (e as Error).message, content: fallback }) }] };
+      }
+    });
 
-      const urls = urlMap[topic] ?? [];
-      const results: Array<{ url: string; content?: string; error?: string }> = [];
+    // ══════════════════════════════════════════════════════
+    // TIER 2
+    // ══════════════════════════════════════════════════════
 
-      for (const url of urls) {
+    // 5. FAUCET — get testnet tokens
+    server.registerTool("zaxxie_faucet", {
+      title: "Get Testnet Tokens",
+      description: "Check if a wallet needs testnet tokens and provide exact faucet instructions. Checks the live balance first — if already funded, confirms they're ready to build.",
+      inputSchema: {
+        address: z.string().describe("Wallet address (0x...)"),
+      },
+    }, async ({ address }) => {
+      try {
+        const balHex = await rpc("testnet", "eth_getBalance", [address, "latest"]) as string;
+        const balance = hexToEth(balHex);
+        const wei = BigInt(balHex ?? "0x0");
+        const hasFunds = wei >= BigInt(1e16); // >= 0.01 0G
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          address, network: "Galileo Testnet", chainId: 16602,
+          currentBalance: `${balance} 0G`,
+          status: hasFunds ? "✅ Ready — you have enough 0G to build" : "⚠️ Needs tokens",
+          ...(hasFunds ? {} : {
+            instructions: {
+              step1: { label: "Option A — Official Faucet (easiest)", url: "https://faucet.0g.ai", action: "Paste your address → complete captcha → receive 0.1 0G" },
+              step2: { label: "Option B — Google Cloud Faucet", url: "https://cloud.google.com/application/web3/faucet/0g/galileo", action: "Sign in with Google → paste address → receive tokens" },
+              step3: { label: "Need more? Join Discord", url: "https://discord.gg/0glabs", action: "Ask in #faucet channel for extra tokens" },
+              limit: "0.1 0G per wallet per day — enough for dozens of transactions",
+            },
+          }),
+          explorerUrl: `${EXPLORER.testnet}/address/${address}`,
+        }, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: (e as Error).message, faucet: "https://faucet.0g.ai" }) }] };
+      }
+    });
+
+    // 6. VERIFY CONTRACT — check on explorer
+    server.registerTool("zaxxie_verify_contract", {
+      title: "Verify Contract on 0G",
+      description: "Check if a smart contract is verified on the 0G explorer and return its ABI if available. Also returns the hardhat verify command if not yet verified.",
+      inputSchema: {
+        address: z.string().describe("Contract address (0x...)"),
+        network: z.enum(["testnet","mainnet"]).default("testnet"),
+      },
+    }, async ({ address, network }) => {
+      try {
+        // Check if contract exists on-chain
+        const code = await rpc(network, "eth_getCode", [address, "latest"]) as string;
+        if (!code || code === "0x") {
+          return { content: [{ type: "text", text: JSON.stringify({ address, error: "No contract found at this address on " + network, explorerUrl: `${EXPLORER[network]}/address/${address}` }) }] };
+        }
+
+        // Try the chainscan API for verification info
+        const apiBase = network === "testnet"
+          ? "https://chainscan-galileo.0g.ai/open/api"
+          : "https://chainscan.0g.ai/open/api";
+
+        let verificationInfo: Record<string, unknown> = { verified: false };
         try {
-          const res = await fetch(url, {
-            headers: { "User-Agent": "Zaxxie-MCP/3.0 (https://zaxxie.vercel.app)" },
-            signal: AbortSignal.timeout(8000),
+          const apiRes = await fetch(`${apiBase}?module=contract&action=getsourcecode&address=${address}`, {
+            signal: AbortSignal.timeout(6_000),
           });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const html = await res.text();
+          if (apiRes.ok) {
+            const data = await apiRes.json();
+            if (data?.result?.[0]?.ABI && data.result[0].ABI !== "Contract source code not verified") {
+              verificationInfo = { verified: true, contractName: data.result[0].ContractName, abi: data.result[0].ABI, sourceCode: data.result[0].SourceCode ? "available" : "not available" };
+            }
+          }
+        } catch { /* explorer API optional */ }
 
-          // Strip HTML tags and collapse whitespace for readable output
-          const text = html
-            .replace(/<script[\s\S]*?<\/script>/gi, "")
-            .replace(/<style[\s\S]*?<\/style>/gi, "")
-            .replace(/<[^>]+>/g, " ")
-            .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#\d+;/g, " ")
-            .replace(/\s{3,}/g, "\n\n")
-            .trim()
-            .slice(0, 6000); // keep it manageable
+        return { content: [{ type: "text", text: JSON.stringify({
+          address, network, onChain: true,
+          bytecodeSize: Math.floor((code.length - 2) / 2) + " bytes",
+          ...verificationInfo,
+          explorerUrl: `${EXPLORER[network]}/address/${address}`,
+          ...(!verificationInfo.verified ? {
+            verifyCommand: `npx hardhat verify ${address} --network 0g-${network}`,
+            note: "Run this in your project directory after npx hardhat compile",
+          } : {}),
+        }, null, 2) }] };
+      } catch (e) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: (e as Error).message }) }] };
+      }
+    });
 
-          results.push({ url, content: text });
-        } catch (e: unknown) {
-          results.push({ url, error: (e as Error).message });
+    // 7. PREFLIGHT — health check before building/deploying
+    server.registerTool("zaxxie_preflight", {
+      title: "Pre-Deploy Health Check",
+      description: "Run a complete health check before building or deploying — checks wallet balance, RPC connectivity, storage indexer, and compute marketplace. Returns go/no-go for each with fix instructions.",
+      inputSchema: {
+        walletAddress: z.string().describe("Your wallet address (0x...)"),
+        features: z.array(z.enum(["chain","storage","compute","da","infts"])).describe("What you're about to build"),
+        network: z.enum(["testnet","mainnet"]).default("testnet"),
+      },
+    }, async ({ walletAddress, features, network }) => {
+      const checks: Record<string, unknown> = {};
+      let allGood = true;
+
+      // Check RPC
+      try {
+        const block = await rpc(network, "eth_blockNumber", []) as string;
+        checks.rpc = { status: "✅", message: `Connected — block ${hexToInt(block)}`, url: RPC[network] };
+      } catch (e) {
+        checks.rpc = { status: "❌", message: (e as Error).message, url: RPC[network] };
+        allGood = false;
+      }
+
+      // Check wallet balance
+      try {
+        const balHex = await rpc(network, "eth_getBalance", [walletAddress, "latest"]) as string;
+        const balance = hexToEth(balHex);
+        const wei = BigInt(balHex ?? "0x0");
+        const ok = wei >= BigInt(1e16);
+        checks.wallet = { status: ok ? "✅" : "⚠️", balance: `${balance} 0G`, canDeploy: ok, address: walletAddress, ...(!ok ? { fix: "Get tokens at https://faucet.0g.ai" } : {}) };
+        if (!ok) allGood = false;
+      } catch (e) {
+        checks.wallet = { status: "❌", message: (e as Error).message };
+        allGood = false;
+      }
+
+      // Check storage indexer
+      if (features.includes("storage")) {
+        try {
+          const res = await fetch(INDEXER[network], { method: "HEAD", signal: AbortSignal.timeout(5_000) });
+          checks.storageIndexer = { status: res.ok || res.status < 500 ? "✅" : "⚠️", url: INDEXER[network], httpStatus: res.status };
+        } catch (e) {
+          checks.storageIndexer = { status: "⚠️", message: (e as Error).message, url: INDEXER[network], note: "Indexer may still work — HEAD requests sometimes rejected" };
         }
       }
 
-      const fallback = buildDocs(topic === "zero-coding" ? "all" : topic);
-      const output = {
-        topic,
-        fetched: results,
-        cached: results.some(r => r.error) ? fallback : undefined,
-        note: "Content fetched live from 0G docs. If fetch failed, cached knowledge is provided as fallback.",
-      };
+      // Check compute marketplace
+      if (features.includes("compute")) {
+        try {
+          const res = await fetch("https://compute-marketplace.0g.ai/inference", { method: "HEAD", signal: AbortSignal.timeout(5_000) });
+          checks.compute = { status: res.ok || res.status < 500 ? "✅" : "⚠️", url: "https://compute-marketplace.0g.ai/inference" };
+        } catch (e) {
+          checks.compute = { status: "⚠️", message: (e as Error).message };
+        }
+      }
 
-      return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify({
+        summary: allGood ? "✅ All checks passed — ready to build!" : "⚠️ Some checks need attention",
+        network, chainId: CHAIN_ID[network], checks,
+        nextStep: allGood ? "Run zaxxie_build with your idea" : "Fix the issues above, then run zaxxie_preflight again",
+      }, null, 2) }] };
     });
 
-    // ── 5. ONBOARD ────────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════
+    // TIER 3
+    // ══════════════════════════════════════════════════════
+
+    // 8. DEPLOY CONTRACT — server-side deployment
+    server.registerTool("zaxxie_deploy_contract", {
+      title: "Deploy Contract to 0G",
+      description: "Deploy a compiled smart contract directly to 0G testnet from the server. Provide your private key, ABI (JSON string), and bytecode. Returns the deployed contract address, tx hash, and explorer link. TESTNET ONLY for security.",
+      inputSchema: {
+        privateKey: z.string().describe("Your private key (0x...) — TESTNET ONLY, never use mainnet key here"),
+        abi: z.string().describe("Contract ABI as a JSON string — from hardhat artifacts or solc output"),
+        bytecode: z.string().describe("Contract bytecode (0x...) — from hardhat artifacts or solc output"),
+        constructorArgs: z.array(z.union([z.string(), z.number(), z.boolean()])).default([]).describe("Constructor arguments in order"),
+        contractName: z.string().default("Contract").describe("Contract name — for display only"),
+      },
+    }, async ({ privateKey, abi, bytecode, constructorArgs, contractName }) => {
+      // Safety: only testnet
+      const network = "testnet" as const;
+      try {
+        // Validate inputs
+        if (!privateKey.startsWith("0x") || privateKey.length < 64)
+          throw new Error("Invalid private key format — must start with 0x and be 64+ hex chars");
+        if (!bytecode.startsWith("0x"))
+          throw new Error("Bytecode must start with 0x — get it from hardhat artifacts/");
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let parsedAbi: any[];
+        try { parsedAbi = JSON.parse(abi); }
+        catch { throw new Error("Invalid ABI — must be valid JSON. Get it from artifacts/contracts/YourContract.sol/YourContract.json"); }
+
+        const provider = new ethers.JsonRpcProvider(RPC[network]);
+        const wallet = new ethers.Wallet(privateKey, provider);
+
+        // Check balance before attempting deploy
+        const balance = await provider.getBalance(wallet.address);
+        if (balance < BigInt(1e15))
+          throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} 0G. Get tokens at https://faucet.0g.ai`);
+
+        const factory = new ethers.ContractFactory(parsedAbi, bytecode, wallet);
+        const contract = await factory.deploy(...constructorArgs);
+        await contract.waitForDeployment();
+
+        const address = await contract.getAddress();
+        const txHash = contract.deploymentTransaction()?.hash ?? "";
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          contractName,
+          address,
+          txHash,
+          network: "Galileo Testnet",
+          chainId: 16602,
+          explorerUrl: `${EXPLORER[network]}/address/${address}`,
+          txUrl: `${EXPLORER[network]}/tx/${txHash}`,
+          verifyCommand: `npx hardhat verify ${address} --network 0g-testnet`,
+          message: `✅ ${contractName} deployed successfully at ${address}`,
+        }, null, 2) }] };
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("insufficient") ? "Get tokens at https://faucet.0g.ai"
+            : msg.includes("ABI") ? "Find ABI at artifacts/contracts/YourContract.sol/YourContract.json after npx hardhat compile"
+            : msg.includes("bytecode") ? "Find bytecode in the same JSON file as ABI"
+            : "Run zaxxie_troubleshoot with this error for help",
+        }) }] };
+      }
+    });
+
+    // ══════════════════════════════════════════════════════
+    // CORE TOOLS
+    // ══════════════════════════════════════════════════════
+
+    // 9. ONBOARD
     server.registerTool("zaxxie_onboard", {
       title: "0G Onboarding Guide",
-      description: "Complete beginner guide — install MetaMask, add 0G network, get testnet tokens, export private key. Use when a user has no wallet or doesn't know how to get started on 0G.",
+      description: "Complete beginner guide — MetaMask install, add 0G network to MetaMask, get testnet tokens, export private key. Use when a user has no wallet or doesn't know how to get started.",
       inputSchema: {
-        step: z.enum(["all", "metamask", "network", "faucet", "verify"]).default("all").describe("Which onboarding step to show"),
+        step: z.enum(["all","metamask","network","faucet","verify"]).default("all"),
       },
     }, async ({ step }) => {
-      const sections: Record<string, string> = {
-        metamask: `STEP 1 — Install MetaMask\n${"─".repeat(40)}\n1. Go to https://metamask.io/download\n2. Click "Install MetaMask for Chrome"\n3. Click the fox icon → "Create a new wallet"\n4. Set a password\n5. Write down your 12-word Secret Recovery Phrase on paper\n   ⚠️ Never share this with anyone\n6. Confirm your phrase → Done\nYour wallet address looks like: 0x1234...abcd\n`,
-        network: `STEP 2 — Add 0G Network\n${"─".repeat(40)}\nOption A — Automatic:\n  Go to https://chainlist.org/?search=0g → Find "0G Galileo Testnet" → Add to MetaMask\n\nOption B — Manual in MetaMask:\n  Network Name: 0G-Galileo-Testnet\n  RPC URL:      https://evmrpc-testnet.0g.ai\n  Chain ID:     16602\n  Symbol:       0G\n  Explorer:     https://chainscan-galileo.0g.ai\n`,
-        faucet: `STEP 3 — Get Free Testnet Tokens\n${"─".repeat(40)}\nOfficial:  https://faucet.0g.ai\nGoogle:    https://cloud.google.com/application/web3/faucet/0g/galileo\nLimit: 0.1 0G per wallet per day\nNeed more? Ask in Discord: https://discord.gg/0glabs\n`,
-        verify: `STEP 4 — Verify Setup\n${"─".repeat(40)}\n1. Open MetaMask → confirm you're on "0G-Galileo-Testnet"\n2. Check balance shows 0.1 0G\n3. View on explorer: https://chainscan-galileo.0g.ai → paste your address\n4. Export private key: MetaMask → Account Details → Show private key\n   ⚠️ Never share or commit this key\n`,
+      const s = {
+        metamask: `STEP 1 — Install MetaMask\n${"─".repeat(40)}\n1. Go to https://metamask.io/download\n2. Click "Install MetaMask for Chrome"\n3. Click the fox icon in your browser toolbar → "Create a new wallet"\n4. Set a strong password\n5. WRITE DOWN your 12-word Secret Recovery Phrase on paper — never digital\n6. Confirm your phrase → Done\n\nYour wallet address looks like: 0x1a2b3c...`,
+        network: `STEP 2 — Add 0G Network to MetaMask\n${"─".repeat(40)}\nOption A — Automatic (recommended):\n  Go to https://chainlist.org/?search=0g\n  Find "0G Galileo Testnet" → Add to MetaMask → Approve\n\nOption B — Manual:\n  MetaMask → network dropdown → Add network → Add manually\n  Network Name: 0G-Galileo-Testnet\n  RPC URL:      https://evmrpc-testnet.0g.ai\n  Chain ID:     16602\n  Symbol:       0G\n  Explorer:     https://chainscan-galileo.0g.ai`,
+        faucet: `STEP 3 — Get Free Testnet Tokens\n${"─".repeat(40)}\nOption A: https://faucet.0g.ai\n  → Paste your wallet address → Complete captcha → Receive 0.1 0G\n\nOption B: https://cloud.google.com/application/web3/faucet/0g/galileo\n  → Sign in with Google → Paste address → Receive tokens\n\nLimit: 0.1 0G per wallet per day\nNeed more? Discord: https://discord.gg/0glabs → #faucet`,
+        verify: `STEP 4 — Verify Everything Works\n${"─".repeat(40)}\n1. Open MetaMask — confirm you're on "0G-Galileo-Testnet" (Chain ID 16602)\n2. You should see ~0.1 0G balance\n3. Check on explorer: https://chainscan-galileo.0g.ai → paste your address\n\nGet your private key (needed for SDK & Zaxxie):\n  MetaMask → click your account → three dots → Account Details → Show private key\n  ⚠️ NEVER share this key or commit it to git`,
       };
-
-      const keys = step === "all" ? ["metamask", "network", "faucet", "verify"] : [step];
-      const output = keys.map(k => sections[k]).join("\n") + "\nReady to build? Tell Zaxxie your idea!\n";
-      return { content: [{ type: "text", text: output }] };
+      const keys = step === "all" ? ["metamask","network","faucet","verify"] : [step];
+      return { content: [{ type: "text", text: keys.map(k => s[k as keyof typeof s]).join("\n\n") + "\n\n✅ Ready to build! Tell Zaxxie what you want to create." }] };
     });
 
-    // ── 6. TROUBLESHOOT ───────────────────────────────────────────────────────
+    // 10. TROUBLESHOOT
     server.registerTool("zaxxie_troubleshoot", {
       title: "Troubleshoot 0G Issues",
-      description: "Diagnose and fix common errors building on 0G — wrong EVM version, missing deps, storage failures, compute issues, transaction errors, insufficient balance.",
+      description: "Diagnose and fix common errors building on 0G — EVM version, missing deps, storage failures, compute issues, gas errors, deploy failures.",
       inputSchema: {
         error: z.string().describe("The error message or description of the problem"),
       },
     }, async ({ error }) => {
-      const lower = error.toLowerCase();
+      const s = error.toLowerCase();
       const fixes: string[] = [`Error: "${error}"\n`];
 
-      if (/evm.version|opcode|invalid opcode|cancun|shanghai/.test(lower))
-        fixes.push(`FIX — Wrong EVM Version\nAdd to hardhat.config.ts:\n  settings: { evmVersion: "cancun" }  // REQUIRED for 0G Chain\nWith Foundry:\n  forge create --evm-version cancun ...`);
-
-      if (/peer dep|cannot find module|ethers|missing/.test(lower))
-        fixes.push(`FIX — Missing dependency\nnpm install ethers@^6.13.4\nethers must be installed separately — it's a peer dep for all 0G SDKs.`);
-
-      if (/upload|storage|indexer|merkle|root hash|zgfile/.test(lower))
-        fixes.push(`FIX — Storage Upload\n1. Use correct indexer:\n   Testnet: https://indexer-storage-testnet-turbo.0g.ai\n   Mainnet: https://indexer-storage-turbo.0g.ai\n2. Get tokens at https://faucet.0g.ai\n3. Call file.close() after upload — required\n4. Save the root hash — you need it to download`);
-
-      if (/insufficient|balance|gas|fee|funds/.test(lower))
-        fixes.push(`FIX — Insufficient Balance\nGet free testnet tokens:\n  https://faucet.0g.ai\n  https://cloud.google.com/application/web3/faucet/0g/galileo\nCheck balance: https://chainscan-galileo.0g.ai`);
-
-      if (/private key|signer|wallet|account/.test(lower))
-        fixes.push(`FIX — Private Key\nMetaMask → Account → 3-dot menu → Account Details → Export Private Key\nIn .env: PRIVATE_KEY=0xYOUR_KEY\nIn code: new ethers.Wallet(process.env.PRIVATE_KEY!, provider)\n⚠️ Never hardcode or commit your key`);
-
-      if (/network|chain id|rpc|connect|timeout/.test(lower))
-        fixes.push(`FIX — Network Connection\nTestnet RPC: https://evmrpc-testnet.0g.ai  (Chain ID: 16602)\nMainnet RPC: https://evmrpc.0g.ai         (Chain ID: 16661)\nStorage Indexer testnet: https://indexer-storage-testnet-turbo.0g.ai\nStorage Indexer mainnet: https://indexer-storage-turbo.0g.ai`);
-
-      if (/compute|broker|inference|bearer|secret|provider/.test(lower))
-        fixes.push(`FIX — Compute / AI\n1. Fund ledger: await broker.ledger.addLedger("0.1")\n2. Get Bearer token: 0g-compute-cli inference get-secret --provider <ADDR>\n3. Headers are single-use — call getRequestHeaders() before EVERY request\n4. Always call processResponse() after getting AI output\n5. Browse providers: https://compute-marketplace.0g.ai/inference`);
-
-      if (/deploy|contract|verify|hardhat/.test(lower))
-        fixes.push(`FIX — Contract Deploy\n1. npx hardhat compile\n2. Check evmVersion: "cancun" in hardhat.config.ts\n3. npx hardhat run scripts/deploy.ts --network 0g-testnet\n4. Verify: npx hardhat verify ADDR --network 0g-testnet\nIf "nonce too low": reset MetaMask nonce (Settings → Advanced → Reset)\nIf "underpriced": add gasPrice: 1000000000 to network config`);
+      if (/evm.version|opcode|invalid opcode|cancun|shanghai/.test(s))
+        fixes.push(`FIX — Wrong EVM Version\nAdd to hardhat.config.ts:\n  settings: { evmVersion: "cancun" }  // REQUIRED\nWith Foundry: forge create --evm-version cancun ...`);
+      if (/peer dep|cannot find module|resolve|missing|ethers/.test(s))
+        fixes.push(`FIX — Missing Dependency\nnpm install ethers@^6.13.4\nAll 0G SDKs require ethers as a peer dependency.`);
+      if (/upload|storage|indexer|merkle|zgblob|zgfile|0g-ts-sdk/.test(s))
+        fixes.push(`FIX — Storage\n1. Use browser SDK in Next.js:\n   import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser"\n2. Testnet indexer: https://indexer-storage-testnet-turbo.0g.ai\n3. Mainnet indexer: https://indexer-storage-turbo.0g.ai\n4. Always return { rootHash, txHash } after upload\n5. Get tokens: https://faucet.0g.ai`);
+      if (/insufficient|balance|gas|fee|funds/.test(s))
+        fixes.push(`FIX — No Balance\nhttps://faucet.0g.ai — 0.1 0G free per day\nhttps://cloud.google.com/application/web3/faucet/0g/galileo\nCheck balance: https://chainscan-galileo.0g.ai`);
+      if (/private key|signer|wallet|account/.test(s))
+        fixes.push(`FIX — Private Key\nMetaMask → Account → 3-dot menu → Account Details → Export Private Key\n.env: PRIVATE_KEY=0xYOUR_KEY (must start with 0x)\nCode: new ethers.Wallet(process.env.PRIVATE_KEY!, provider)`);
+      if (/network|chain id|rpc|connect|timeout|econnref/.test(s))
+        fixes.push(`FIX — Network\nTestnet: https://evmrpc-testnet.0g.ai  (Chain ID 16602)\nMainnet: https://evmrpc.0g.ai          (Chain ID 16661)\nStorage testnet: https://indexer-storage-testnet-turbo.0g.ai\nStorage mainnet: https://indexer-storage-turbo.0g.ai`);
+      if (/compute|broker|inference|bearer|secret|provider|serving/.test(s))
+        fixes.push(`FIX — Compute / AI\n1. Fund: await broker.ledger.addLedger("0.1")\n2. Headers are SINGLE-USE — call getRequestHeaders() before every request\n3. Always call processResponse() after getting AI reply\n4. Get provider address: https://compute-marketplace.0g.ai/inference`);
+      if (/deploy|contract|verify|hardhat|artifact|bytecode/.test(s))
+        fixes.push(`FIX — Contract Deploy\n1. npx hardhat compile\n2. evmVersion: "cancun" in hardhat.config.ts — critical\n3. npx hardhat run scripts/deploy.ts --network 0g-testnet\n4. npx hardhat verify ADDR --network 0g-testnet\nBytecode/ABI: artifacts/contracts/YourContract.sol/YourContract.json`);
 
       if (fixes.length === 1)
-        fixes.push(`No specific match. Most common 0G issues:\n1. evmVersion: "cancun" missing in hardhat.config\n2. npm install ethers@^6.13.4 — must install separately\n3. No balance — https://faucet.0g.ai\n4. Wrong RPC — https://evmrpc-testnet.0g.ai\n5. Storage indexer — https://indexer-storage-testnet-turbo.0g.ai\nMore help: https://discord.gg/0glabs | https://docs.0g.ai`);
+        fixes.push(`No match. Common 0G issues:\n1. evmVersion: "cancun" in hardhat.config — always\n2. npm install ethers@^6.13.4\n3. Tokens: https://faucet.0g.ai\n4. Testnet RPC: https://evmrpc-testnet.0g.ai (chain 16602)\n5. Storage indexer: https://indexer-storage-testnet-turbo.0g.ai\nHelp: https://discord.gg/0glabs`);
 
       return { content: [{ type: "text", text: fixes.join("\n\n") }] };
     });
 
-    // ── 7. GET DOCS ───────────────────────────────────────────────────────────
+    // 11. GET DOCS
     server.registerTool("zaxxie_get_docs", {
       title: "Get 0G Docs",
-      description: "Get complete 0G developer documentation from cached knowledge. Covers: chain, storage, compute, da, infts, network, or all.",
+      description: "Complete 0G documentation from cached knowledge — chain, storage, compute, da, infts, network, or all.",
       inputSchema: {
-        topic: z.enum(["chain", "storage", "compute", "da", "infts", "network", "all"]).describe("Topic to get docs for"),
+        topic: z.enum(["chain","storage","compute","da","infts","network","all"]),
       },
     }, async ({ topic }) => {
       return { content: [{ type: "text", text: buildDocs(topic) }] };
     });
 
-    // ── 8. SCAFFOLD ───────────────────────────────────────────────────────────
+    // 12. SCAFFOLD
     server.registerTool("zaxxie_scaffold", {
       title: "Scaffold 0G Project",
-      description: "Generate a 0G project scaffold with package.json, configs, and code examples as a JSON structure.",
+      description: "Generate a complete 0G project scaffold — same structured output as zaxxie_build but without idea auto-detection.",
       inputSchema: {
-        projectName: z.string().describe("Project name"),
-        description: z.string().describe("What the dApp should do"),
-        features: z.array(z.enum(["chain", "storage", "compute", "da", "infts"])).describe("0G features to include"),
-        framework: z.enum(["nextjs", "react", "express", "hardhat", "custom"]).default("nextjs").describe("Framework"),
+        projectName: z.string(),
+        description: z.string(),
+        features: z.array(z.enum(["chain","storage","compute","da","infts"])),
+        framework: z.enum(["nextjs","react","express","hardhat","custom"]).default("nextjs"),
       },
     }, async ({ projectName, description, features, framework }) => {
-      const result = buildProject(projectName, description, features, framework);
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(buildProject(projectName, description, features, framework), null, 2) }] };
     });
 
-    // ── 9. NETWORK ────────────────────────────────────────────────────────────
+    // 13. NETWORK
     server.registerTool("zaxxie_network", {
       title: "0G Network Info",
-      description: "Get 0G network details — RPCs, chain IDs, contract addresses, storage indexers, faucets, explorer URLs.",
+      description: "RPCs, chain IDs, storage indexers, contract addresses, faucets, explorer URLs for testnet and mainnet.",
       inputSchema: {
-        network: z.enum(["testnet", "mainnet", "both"]).default("testnet").describe("Which network"),
+        network: z.enum(["testnet","mainnet","both"]).default("testnet"),
       },
     }, async ({ network }) => {
       const info: Record<string, unknown> = {};
@@ -1059,19 +1148,19 @@ const handler = createMcpHandler(
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     });
 
-    // ── 10. MODELS ────────────────────────────────────────────────────────────
+    // 14. MODELS
     server.registerTool("zaxxie_models", {
       title: "0G AI Models",
-      description: "List available AI models on 0G Compute with pricing — LLMs, text-to-image, speech-to-text.",
+      description: "Available AI models on 0G Compute with pricing — LLMs, text-to-image, speech-to-text.",
       inputSchema: {
-        network: z.enum(["testnet", "mainnet", "both"]).default("both").describe("Which network"),
+        network: z.enum(["testnet","mainnet","both"]).default("both"),
       },
     }, async ({ network }) => {
       const info: Record<string, unknown> = {};
       if (network !== "mainnet") info.testnet = OG_KNOWLEDGE.compute.services.testnet;
       if (network !== "testnet") info.mainnet = OG_KNOWLEDGE.compute.services.mainnet;
       info.marketplace = OG_KNOWLEDGE.networks.testnet.computeMarketplace;
-      info.usage = "Use OpenAI-compatible SDK. Get Bearer token: 0g-compute-cli inference get-secret --provider <ADDR>";
+      info.note = "OpenAI-compatible API. Get Bearer token: 0g-compute-cli inference get-secret --provider <ADDR>";
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     });
 

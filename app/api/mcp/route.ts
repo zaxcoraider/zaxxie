@@ -1981,6 +1981,445 @@ const handler = createMcpHandler(
       }
     });
 
+    // ══════════════════════════════════════════════════════
+    // BUG FINDER TOOLS
+    // ══════════════════════════════════════════════════════
+
+    // 23. DEBUG TX — decode failed transaction revert reasons
+    server.registerTool("zaxxie_debug_tx", {
+      title: "Debug Failed Transaction",
+      description: "Paste any failed transaction hash — Zaxxie fetches it, replays it on-chain to extract the exact revert reason, decodes custom errors and panic codes, and tells you precisely what broke and how to fix it. Works for any 0G contract failure.",
+      inputSchema: {
+        txHash: z.string().describe("Failed transaction hash (0x...)"),
+        abi: z.string().optional().describe("Contract ABI as JSON string — enables decoding of custom errors if provided"),
+        network: z.enum(["testnet", "mainnet"]).default("testnet"),
+      },
+    }, async ({ txHash, abi, network }) => {
+      try {
+        // Step 1: Get receipt to confirm failure
+        const receipt = await rpc(network, "eth_getTransactionReceipt", [txHash]) as {
+          status: string; blockNumber: string; gasUsed: string; to: string; from: string;
+        } | null;
+
+        if (!receipt) {
+          return { content: [{ type: "text", text: JSON.stringify({
+            success: false,
+            status: "not_found",
+            message: "Transaction not found — may still be pending or the hash is incorrect",
+            tip: "Use zaxxie_check_tx to check if the tx is still pending",
+          }) }] };
+        }
+
+        if (receipt.status === "0x1") {
+          return { content: [{ type: "text", text: JSON.stringify({
+            success: true,
+            status: "succeeded",
+            txHash,
+            blockNumber: hexToInt(receipt.blockNumber),
+            gasUsed: hexToInt(receipt.gasUsed).toLocaleString(),
+            message: "This transaction succeeded — no bug found",
+            explorerUrl: `${EXPLORER[network]}/tx/${txHash}`,
+          }) }] };
+        }
+
+        // Step 2: Fetch original tx to replay
+        const tx = await rpc(network, "eth_getTransactionByHash", [txHash]) as {
+          from: string; to: string; input: string; value: string; gas: string; blockNumber: string;
+        } | null;
+
+        if (!tx) throw new Error("Could not fetch transaction data");
+
+        // Step 3: Replay with eth_call at the same block to extract revert data
+        let revertData = "0x";
+        let revertMsg = "Unknown revert — no revert data returned by RPC";
+
+        try {
+          await rpc(network, "eth_call", [
+            { from: tx.from, to: tx.to, data: tx.input, value: tx.value, gas: tx.gas },
+            tx.blockNumber,
+          ]);
+          // If eth_call succeeds here, the revert was gas-related or state-dependent
+          revertMsg = "eth_call did not revert at replay — likely a gas limit issue or state has changed since the failed block";
+        } catch (callErr) {
+          const errMsg = (callErr as Error).message ?? "";
+          // Extract hex revert data from error message (ethers / RPC format)
+          const hexMatch = errMsg.match(/0x[0-9a-fA-F]{8,}/);
+          if (hexMatch) revertData = hexMatch[0];
+          revertMsg = errMsg;
+        }
+
+        // Step 4: Decode revert data
+        const ERR_SIG    = "0x08c379a0"; // Error(string)
+        const PANIC_SIG  = "0x4e487b71"; // Panic(uint256)
+
+        const PANIC_CODES: Record<number, string> = {
+          0x00: "Generic compiler panic",
+          0x01: "assert() failed — assertion was false",
+          0x11: "Arithmetic overflow or underflow",
+          0x12: "Division or modulo by zero",
+          0x21: "Enum value out of range",
+          0x22: "Storage byte array incorrectly encoded",
+          0x31: "pop() called on empty array",
+          0x32: "Array index out of bounds",
+          0x41: "Too much memory allocated (out of memory)",
+          0x51: "Called a zero-initialized internal function",
+        };
+
+        let decoded: Record<string, unknown> = {};
+
+        if (revertData.startsWith(ERR_SIG)) {
+          // Standard Error(string)
+          try {
+            const iface = new ethers.Interface(["function Error(string)"]);
+            const [msg] = iface.decodeFunctionData("Error", revertData.replace(ERR_SIG, "0x00000000"));
+            decoded = { type: "require/revert string", message: String(msg) };
+          } catch {
+            decoded = { type: "require/revert string", raw: revertData };
+          }
+        } else if (revertData.startsWith(PANIC_SIG)) {
+          // Panic(uint256)
+          try {
+            const codeHex = revertData.slice(-64);
+            const code = parseInt(codeHex, 16);
+            decoded = {
+              type: "panic",
+              code: `0x${code.toString(16).padStart(2, "0")}`,
+              meaning: PANIC_CODES[code] ?? `Unknown panic code 0x${code.toString(16)}`,
+            };
+          } catch {
+            decoded = { type: "panic", raw: revertData };
+          }
+        } else if (abi && revertData.length >= 10) {
+          // Try to decode as a custom error from ABI
+          try {
+            const parsedAbi = JSON.parse(abi);
+            const iface = new ethers.Interface(parsedAbi);
+            const parsed = iface.parseError(revertData);
+            if (parsed) {
+              decoded = {
+                type: "custom error",
+                name: parsed.name,
+                args: Object.fromEntries(
+                  parsed.fragment.inputs.map((inp, i) => [inp.name || `arg${i}`, parsed.args[i]?.toString()])
+                ),
+              };
+            }
+          } catch {
+            decoded = { type: "custom error", raw: revertData, hint: "Provide ABI to decode custom errors" };
+          }
+        } else if (revertData !== "0x") {
+          decoded = { type: "unknown revert data", raw: revertData, hint: "Provide ABI to decode custom errors" };
+        }
+
+        // Step 5: Generate fix suggestions
+        const fixes: string[] = [];
+        const decodedMsg = ((decoded.message ?? decoded.meaning ?? "") as string).toLowerCase();
+        const decodedType = (decoded.type ?? "") as string;
+
+        if (decodedType === "panic" && decoded.code === "0x11")
+          fixes.push("Arithmetic overflow/underflow — use Solidity 0.8+ (built-in checks) or OpenZeppelin SafeMath");
+        if (decodedType === "panic" && decoded.code === "0x01")
+          fixes.push("assert() failed — check your invariants, assert() should never fail in normal usage");
+        if (decodedType === "panic" && decoded.code === "0x32")
+          fixes.push("Array out of bounds — add bounds check before accessing array elements");
+        if (decodedType === "panic" && decoded.code === "0x12")
+          fixes.push("Division by zero — add a require(denominator > 0) check before division");
+        if (decodedMsg.includes("insufficient") || decodedMsg.includes("balance"))
+          fixes.push("Insufficient balance — ensure the wallet has enough 0G. Use zaxxie_faucet to get tokens.");
+        if (decodedMsg.includes("not owner") || decodedMsg.includes("unauthorized") || decodedMsg.includes("access"))
+          fixes.push("Access control failure — the caller is not authorized. Check Ownable/role setup.");
+        if (decodedMsg.includes("already") || decodedMsg.includes("exists"))
+          fixes.push("State conflict — the operation was already performed or the state prevents it.");
+        if (decodedMsg.includes("zero address") || decodedMsg.includes("invalid address"))
+          fixes.push("Zero address — validate input addresses with require(addr != address(0))");
+        if (decodedMsg.includes("transfer") || decodedMsg.includes("allowance") || decodedMsg.includes("approve"))
+          fixes.push("ERC-20 transfer issue — check allowance with approve() before transferFrom()");
+        if (fixes.length === 0)
+          fixes.push("Run zaxxie_audit_contract on your Solidity source to find potential bugs before deploying");
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          status: "failed",
+          txHash,
+          network,
+          blockNumber: hexToInt(receipt.blockNumber),
+          gasUsed: hexToInt(receipt.gasUsed).toLocaleString(),
+          from: tx.from,
+          to: receipt.to,
+          revert: decoded,
+          rawRevertData: revertData !== "0x" ? revertData : undefined,
+          fixes,
+          explorerUrl: `${EXPLORER[network]}/tx/${txHash}`,
+          message: `Transaction failed — ${decoded.type ?? "unknown revert"}${decoded.message ? `: ${decoded.message}` : decoded.meaning ? `: ${decoded.meaning}` : ""}`,
+        }, null, 2) }] };
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("not found") ? "Check the tx hash and network — use zaxxie_check_tx first"
+            : "Run zaxxie_troubleshoot with this error for general 0G help",
+        }) }] };
+      }
+    });
+
+    // 24. AUDIT CONTRACT — static security analysis of Solidity source
+    server.registerTool("zaxxie_audit_contract", {
+      title: "Audit Solidity Contract",
+      description: "Static security analysis of any Solidity source code. Checks for reentrancy, tx.origin auth, unchecked low-level calls, integer overflow, selfdestruct, delegatecall abuse, block.timestamp dependency, access control issues, and more. Returns severity-rated findings with exact line references and fix suggestions. Run before deploying any contract.",
+      inputSchema: {
+        source: z.string().describe("Solidity source code to audit"),
+        contractName: z.string().optional().describe("Contract name — for display in report"),
+      },
+    }, async ({ source, contractName }) => {
+      const name = contractName ?? source.match(/contract\s+(\w+)/)?.[1] ?? "Contract";
+      const lines = source.split("\n");
+
+      type Severity = "CRITICAL" | "HIGH" | "MEDIUM" | "LOW" | "INFO";
+      interface Finding {
+        id: string;
+        severity: Severity;
+        title: string;
+        description: string;
+        lines: number[];
+        fix: string;
+      }
+
+      const findings: Finding[] = [];
+
+      // Helper: find all lines matching a pattern
+      function matchLines(pattern: RegExp): number[] {
+        return lines
+          .map((l, i) => ({ l, i }))
+          .filter(({ l }) => pattern.test(l))
+          .map(({ i }) => i + 1);
+      }
+
+      // ── CRITICAL ─────────────────────────────────────────────────────────────
+
+      // Reentrancy: external call before state update
+      const callLines = matchLines(/\.(call|transfer|send)\s*[\({]/);
+      if (callLines.length > 0) {
+        // Heuristic: external call exists — flag for review
+        findings.push({
+          id: "SWC-107",
+          severity: "CRITICAL",
+          title: "Potential Reentrancy",
+          description: "External call (.call/.transfer/.send) detected. If state is updated AFTER this call, a reentrancy attack is possible.",
+          lines: callLines,
+          fix: "Follow Checks-Effects-Interactions pattern: update all state variables BEFORE making external calls. Or use OpenZeppelin ReentrancyGuard.",
+        });
+      }
+
+      // selfdestruct — can destroy contracts and drain ETH
+      const selfdestructLines = matchLines(/\bselfdestruct\s*\(/);
+      if (selfdestructLines.length > 0) {
+        findings.push({
+          id: "SWC-106",
+          severity: "CRITICAL",
+          title: "selfdestruct Usage",
+          description: "selfdestruct destroys the contract and forces ETH to a target address. Any caller with access can drain the contract permanently.",
+          lines: selfdestructLines,
+          fix: "Remove selfdestruct or protect with onlyOwner. Consider using a pausable pattern instead of destructing.",
+        });
+      }
+
+      // ── HIGH ──────────────────────────────────────────────────────────────────
+
+      // tx.origin auth — phishable
+      const txOriginLines = matchLines(/\btx\.origin\b/);
+      if (txOriginLines.length > 0) {
+        findings.push({
+          id: "SWC-115",
+          severity: "HIGH",
+          title: "tx.origin Authentication",
+          description: "tx.origin is the original EOA that started the transaction chain. A malicious contract can phish a user into calling it, then forward the call to your contract — tx.origin will still be the victim.",
+          lines: txOriginLines,
+          fix: "Replace tx.origin with msg.sender for all authentication checks.",
+        });
+      }
+
+      // Unchecked low-level call return value
+      const lowLevelCallLines = matchLines(/\.call\s*[\({]|\.delegatecall\s*[\({]|\.staticcall\s*[\({]/);
+      const checkedCallLines = matchLines(/\(bool\s+\w+.*\)\s*=.*\.call|require\s*\(.*\.call/);
+      const uncheckedCallLines = lowLevelCallLines.filter(l => !checkedCallLines.includes(l));
+      if (uncheckedCallLines.length > 0) {
+        findings.push({
+          id: "SWC-104",
+          severity: "HIGH",
+          title: "Unchecked Low-Level Call Return Value",
+          description: "Low-level calls (.call, .delegatecall) return (bool success, bytes data). If the return value is not checked, a failed call will be silently ignored.",
+          lines: uncheckedCallLines,
+          fix: "Always check the return value: (bool success,) = addr.call{...}(...); require(success, 'Call failed');",
+        });
+      }
+
+      // delegatecall to user-controlled address
+      const delegatecallLines = matchLines(/\.delegatecall\s*[\({]/);
+      if (delegatecallLines.length > 0) {
+        findings.push({
+          id: "SWC-112",
+          severity: "HIGH",
+          title: "delegatecall Usage",
+          description: "delegatecall executes external code in your contract's storage context. If the target address is user-controlled, an attacker can wipe or corrupt your storage.",
+          lines: delegatecallLines,
+          fix: "Never delegatecall to user-supplied addresses. If using a proxy pattern, ensure the implementation address is only settable by the owner.",
+        });
+      }
+
+      // Missing access control on critical functions
+      const ownershipLines = matchLines(/\bonlyOwner\b|\brequire\s*\(\s*msg\.sender\s*==|\bhasRole\b/);
+      const stateChangeFunctions = matchLines(/function\s+\w+\s*\(.*\)\s*(public|external)/);
+      const unprotectedFunctions = stateChangeFunctions.filter(l => {
+        const fnLine = lines[l - 1] ?? "";
+        return (fnLine.includes("public") || fnLine.includes("external"))
+          && !fnLine.includes("view")
+          && !fnLine.includes("pure")
+          && ownershipLines.length === 0;
+      });
+      if (ownershipLines.length === 0 && stateChangeFunctions.length > 0) {
+        findings.push({
+          id: "SWC-105",
+          severity: "HIGH",
+          title: "Missing Access Control",
+          description: "No access control modifiers (onlyOwner, hasRole, require msg.sender) detected on state-changing functions. Anyone can call these functions.",
+          lines: unprotectedFunctions.slice(0, 5),
+          fix: "Add onlyOwner modifier (inherit from Ownable) or implement role-based access with AccessControl. At minimum: require(msg.sender == owner, 'Not authorized');",
+        });
+      }
+
+      // ── MEDIUM ────────────────────────────────────────────────────────────────
+
+      // block.timestamp dependency
+      const timestampLines = matchLines(/\bblock\.timestamp\b|\bnow\b/);
+      if (timestampLines.length > 0) {
+        findings.push({
+          id: "SWC-116",
+          severity: "MEDIUM",
+          title: "Block Timestamp Dependency",
+          description: "block.timestamp can be manipulated by validators within ~15 seconds. Do not use it for randomness or precise timing logic.",
+          lines: timestampLines,
+          fix: "Avoid using block.timestamp for randomness. For time-locks, a 15-second tolerance is acceptable. For randomness, use Chainlink VRF or commit-reveal schemes.",
+        });
+      }
+
+      // Integer overflow (pre-0.8 without SafeMath)
+      const pragmaLine = lines.find(l => l.includes("pragma solidity"));
+      const isPreO8 = pragmaLine && /0\.[0-7]\./.test(pragmaLine);
+      const arithmeticLines = matchLines(/[+\-*]\s*=|\+\+|--|[^=!<>]=\s*\w+\s*[+\-*]\s*\w+/);
+      const safeMatchLines = matchLines(/using\s+SafeMath|\.add\(|\.sub\(|\.mul\(/);
+      if (isPreO8 && arithmeticLines.length > 0 && safeMatchLines.length === 0) {
+        findings.push({
+          id: "SWC-101",
+          severity: "MEDIUM",
+          title: "Integer Overflow/Underflow (pre-0.8)",
+          description: "Solidity < 0.8.0 does not have built-in overflow checks. Arithmetic operations can silently wrap around.",
+          lines: arithmeticLines.slice(0, 5),
+          fix: "Upgrade to Solidity 0.8+ (overflow/underflow checks built-in) or use OpenZeppelin SafeMath for all arithmetic.",
+        });
+      }
+
+      // Floating pragma
+      const floatingPragmaLines = matchLines(/pragma\s+solidity\s+\^|pragma\s+solidity\s+>/);
+      if (floatingPragmaLines.length > 0) {
+        findings.push({
+          id: "SWC-103",
+          severity: "MEDIUM",
+          title: "Floating Pragma",
+          description: "Using ^ or > in pragma solidity means the contract can be compiled with multiple compiler versions, some of which may have bugs.",
+          lines: floatingPragmaLines,
+          fix: "Lock pragma to a specific version: pragma solidity 0.8.24; — use the same version in your hardhat.config.ts.",
+        });
+      }
+
+      // Uninitialized local variable
+      const storagePointerLines = matchLines(/^\s*(uint|int|bytes|string|address|bool|mapping|struct)\s+\w+\s*;(?!\s*=)/);
+      if (storagePointerLines.length > 0) {
+        findings.push({
+          id: "SWC-109",
+          severity: "MEDIUM",
+          title: "Uninitialized Variable",
+          description: "Variables declared without initialization default to 0/false/address(0). If used before being set, this may lead to unexpected behavior.",
+          lines: storagePointerLines.slice(0, 5),
+          fix: "Always initialize variables: uint256 amount = 0; or ensure they are set before use.",
+        });
+      }
+
+      // ── LOW ───────────────────────────────────────────────────────────────────
+
+      // Events missing on state changes
+      const eventLines = matchLines(/\bevent\b\s+\w+/);
+      if (eventLines.length === 0 && stateChangeFunctions.length > 0) {
+        findings.push({
+          id: "BEST-001",
+          severity: "LOW",
+          title: "No Events Emitted",
+          description: "No events are defined. State-changing functions should emit events so off-chain tools (explorers, dApps, zaxxie_monitor) can track activity.",
+          lines: stateChangeFunctions.slice(0, 3),
+          fix: "Define events for every state change: event Transfer(address indexed from, address indexed to, uint256 amount); and emit them.",
+        });
+      }
+
+      // Missing zero-address checks on constructor/setters
+      const setterLines = matchLines(/function\s+set\w*\s*\(.*address/);
+      const zeroCheckLines = matchLines(/require\s*\(.*!=\s*address\s*\(\s*0\s*\)/);
+      if (setterLines.length > 0 && zeroCheckLines.length === 0) {
+        findings.push({
+          id: "BEST-002",
+          severity: "LOW",
+          title: "Missing Zero-Address Validation",
+          description: "Functions accepting address parameters have no zero-address check. Setting a critical address to address(0) can brick the contract.",
+          lines: setterLines,
+          fix: "Add: require(addr != address(0), 'Zero address'); before storing any address parameter.",
+        });
+      }
+
+      // ── INFO ──────────────────────────────────────────────────────────────────
+
+      // 0G-specific: wrong EVM version hint
+      if (!source.includes("evmVersion") && !source.includes("cancun")) {
+        findings.push({
+          id: "0G-001",
+          severity: "INFO",
+          title: "0G Chain: Verify EVM Version",
+          description: "0G Chain requires evmVersion: 'cancun' in your Hardhat config. If compiled with the wrong EVM version, deployment will fail with an invalid opcode error.",
+          lines: [],
+          fix: "In hardhat.config.ts, add: solidity: { settings: { evmVersion: 'cancun' } }. Use zaxxie_deploy_contract — it compiles with cancun automatically.",
+        });
+      }
+
+      // Summarize
+      const bySeverity = (s: Severity) => findings.filter(f => f.severity === s);
+      const score = Math.max(0, 100
+        - bySeverity("CRITICAL").length * 30
+        - bySeverity("HIGH").length * 15
+        - bySeverity("MEDIUM").length * 8
+        - bySeverity("LOW").length * 3
+      );
+
+      const rating = score >= 90 ? "SAFE" : score >= 70 ? "REVIEW RECOMMENDED" : score >= 50 ? "UNSAFE — FIX BEFORE DEPLOY" : "CRITICAL — DO NOT DEPLOY";
+
+      return { content: [{ type: "text", text: JSON.stringify({
+        contract: name,
+        auditedAt: new Date().toISOString(),
+        linesOfCode: lines.length,
+        score: `${score}/100`,
+        rating,
+        summary: {
+          critical: bySeverity("CRITICAL").length,
+          high: bySeverity("HIGH").length,
+          medium: bySeverity("MEDIUM").length,
+          low: bySeverity("LOW").length,
+          info: bySeverity("INFO").length,
+          total: findings.length,
+        },
+        findings: findings.map(f => ({
+          ...f,
+          lines: f.lines.length ? f.lines : undefined,
+        })),
+        note: "This is static analysis — not a full formal verification. Always test on testnet before mainnet. Use zaxxie_debug_tx to diagnose any failures after deploy.",
+      }, null, 2) }] };
+    });
+
   },
   {},
   { basePath: "/api", maxDuration: 120 }

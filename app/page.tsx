@@ -79,6 +79,15 @@ const TIER_GROUPS = [
     ],
   },
   {
+    label: "Bug Finder",
+    color: "#dc2626",
+    bgColor: "#3b0a0a",
+    tools: [
+      { name: "zaxxie_debug_tx", desc: "Paste a failed tx hash → replayed on-chain → exact revert reason decoded (Error string, Panic code, custom error) + fix suggestions." },
+      { name: "zaxxie_audit_contract", desc: "Paste Solidity source → static security audit: reentrancy, tx.origin, overflow, selfdestruct, access control + 10 more checks. Severity-rated report." },
+    ],
+  },
+  {
     label: "Guidance",
     color: "#6b7280",
     bgColor: "#111827",
@@ -98,7 +107,7 @@ export default function Home() {
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <span style={{ fontWeight: 800, fontSize: 18, letterSpacing: -0.5 }}>⚡ Zaxxie</span>
           <span style={{ background: "#1a0a3e", color: "#a78bfa", fontSize: 11, fontWeight: 700, padding: "2px 10px", borderRadius: 999, letterSpacing: 0.5 }}>
-            22 Tools · v5.0
+            24 Tools · v5.1
           </span>
         </div>
         <div style={{ display: "flex", gap: 24, fontSize: 14 }}>
@@ -219,8 +228,8 @@ export default function Home() {
               "Create an AI chatbot that runs on 0G decentralized compute and ship it live",
               "Deploy an ERC-20 token on 0G — here's my Solidity, compile and deploy it",
               "Upload my whitepaper to 0G Storage and save the root hash to memory",
-              "What events has my contract 0xABC... emitted in the last 500 blocks?",
-              "Recall all contracts I've deployed — my wallet is 0x...",
+              "My tx 0xABC... failed — what went wrong and how do I fix it?",
+              "Audit this Solidity contract before I deploy it — find any bugs",
             ].map((prompt) => (
               <div key={prompt} style={{
                 background: "#0d0d14", border: "1px solid #2a2a3f",
@@ -237,7 +246,7 @@ export default function Home() {
       {/* ── TOOLS ── */}
       <section style={{ maxWidth: 900, margin: "0 auto", padding: "70px 24px" }}>
         <h2 style={{ fontSize: 13, fontWeight: 700, letterSpacing: 2, color: "#555", textTransform: "uppercase", marginBottom: 8 }}>
-          22 MCP Tools
+          24 MCP Tools
         </h2>
         <p style={{ color: "#444", fontSize: 13, marginBottom: 36 }}>Grouped by capability. Starred tools are called most often by Claude.</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 32 }}>

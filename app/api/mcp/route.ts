@@ -210,7 +210,13 @@ import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser";
 import { ethers } from "ethers";
 
 const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL ?? "https://evmrpc-testnet.0g.ai";
-const INDEXER_RPC = process.env.NEXT_PUBLIC_INDEXER_RPC ?? "https://indexer-storage-testnet-turbo.0g.ai";
+
+// IMPORTANT: indexer URL must be HTTPS — http:// is blocked by browsers (Mixed Content)
+const INDEXER_RPC = (() => {
+  const url = process.env.NEXT_PUBLIC_INDEXER_RPC ?? "https://indexer-storage-testnet-turbo.0g.ai";
+  // Auto-upgrade http → https to prevent Mixed Content errors
+  return url.replace(/^http:\\/\\//, "https://");
+})();
 
 export function getIndexer() {
   return new Indexer(INDEXER_RPC);
@@ -221,26 +227,40 @@ export async function getSigner(privateKey: string) {
   return new ethers.Wallet(privateKey, provider);
 }
 
-export async function uploadFile(file: File, privateKey: string) {
+export async function uploadFile(file: File, privateKey: string): Promise<{ rootHash: string; txHash: string }> {
   const signer = await getSigner(privateKey);
   const indexer = getIndexer();
 
   // ZgBlob wraps a browser File/Blob
   const zgBlob = new ZgBlob([file], file.name);
   const [tree, treeErr] = await zgBlob.merkleTree();
-  if (treeErr) throw new Error(\`Merkle tree: \${treeErr}\`);
+  if (treeErr) throw new Error(\`Merkle tree failed: \${treeErr}\`);
 
   const rootHash = tree?.rootHash() ?? "";
+  if (!rootHash) throw new Error("Upload failed: could not compute rootHash from file");
+
   const [tx, uploadErr] = await indexer.upload(zgBlob, RPC_URL, signer);
-  if (uploadErr) throw new Error(\`Upload: \${uploadErr}\`);
+  if (uploadErr) throw new Error(\`Upload failed: \${uploadErr}\`);
 
   return { rootHash, txHash: String(tx) };
+}
+
+// Safe upload for INFT metadata — validates rootHash before returning
+// ALWAYS call this and check rootHash before calling mintINFT
+export async function uploadMetadata(metadata: object, privateKey: string): Promise<{ rootHash: string; txHash: string }> {
+  const json = JSON.stringify(metadata);
+  const file = new File([json], "metadata.json", { type: "application/json" });
+  const result = await uploadFile(file, privateKey);
+  if (!result.rootHash || result.rootHash === "0x") {
+    throw new Error("Metadata upload returned empty rootHash — do not proceed to mint");
+  }
+  return result;
 }
 
 export async function downloadFile(rootHash: string, outputPath: string) {
   const indexer = getIndexer();
   const err = await indexer.download(rootHash, outputPath, true);
-  if (err) throw new Error(\`Download: \${err}\`);
+  if (err) throw new Error(\`Download failed: \${err}\`);
 }
 `;
 }
@@ -1195,8 +1215,20 @@ const handler = createMcpHandler(
         fixes.push(`FIX — Wrong EVM Version\nAdd to hardhat.config.ts:\n  settings: { evmVersion: "cancun" }  // REQUIRED\nWith Foundry: forge create --evm-version cancun ...`);
       if (/peer dep|cannot find module|resolve|missing|ethers/.test(s))
         fixes.push(`FIX — Missing Dependency\nnpm install ethers@^6.13.4\nAll 0G SDKs require ethers as a peer dependency.`);
+      if (/mixed content|http.*https|insecure.*request|blocked.*content/.test(s))
+        fixes.push(`FIX — Mixed Content (HTTP vs HTTPS)\nYour page is served over HTTPS but the storage indexer URL is HTTP — browsers block this.\n\n1. Change your indexer URL from http:// to https://:\n   ❌ http://indexer-storage-testnet-turbo.0g.ai\n   ✅ https://indexer-storage-testnet-turbo.0g.ai\n\n2. In your .env / next.config.mjs, ensure:\n   NEXT_PUBLIC_INDEXER_RPC=https://indexer-storage-testnet-turbo.0g.ai\n\n3. In your storage lib:\n   const INDEXER_RPC = "https://indexer-storage-testnet-turbo.0g.ai" // must be https\n\nThis blocks ALL uploads — fix this first before debugging the mint error.`);
+
+      if (/ses removing|unpermitted intrinsics|lockdown|metamask.*ses/.test(s))
+        fixes.push(`FIX — SES / MetaMask Lockdown\n"SES Removing unpermitted intrinsics" is MetaMask's security sandbox running in the browser.\nThis is informational — not an error that breaks your app.\n\nIf it IS causing issues:\n1. Avoid using non-standard globals (Buffer, process, global) in browser code\n2. Use the browser-safe 0G SDK subpath:\n   import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser"\n3. Polyfill if needed in next.config.mjs:\n   webpack: (config) => { config.resolve.fallback = { buffer: require.resolve("buffer/") }; return config; }`);
+
+      if (/missing revert data|estimategas.*call_exception|call_exception.*estimategas|revert=null.*estimategas/.test(s))
+        fixes.push(`FIX — estimateGas CALL_EXCEPTION (missing revert data)\nThe contract reverted BEFORE the transaction was broadcast — gas estimation failed.\nThis means a pre-condition in the contract was not met.\n\nMost common causes:\n1. Metadata upload to 0G Storage failed before mint was called\n   → rootHash is empty/invalid → contract rejects it\n   → FIX: Check "metadata upload failed" error first. Usually a Mixed Content (HTTP vs HTTPS) issue.\n\n2. Insufficient allowance or balance\n   → FIX: Check wallet balance with zaxxie_check_wallet\n\n3. Contract already has this token / state conflict\n   → FIX: Check if the token was already minted\n\n4. Wrong contract address or ABI mismatch\n   → FIX: Verify contract with zaxxie_verify_contract\n\nDebug order: fix upload first → then retry mint. The tx hash will only exist after gas estimation passes.`);
+
+      if (/mint.*metadata.*upload.*fail|metadata.*upload.*fail.*mint|upload failed.*mint|inft.*upload|mintinft.*error/.test(s))
+        fixes.push(`FIX — INFT Mint: Metadata Upload Failed Before Mint\nThe mint flow is: upload metadata to 0G Storage → get rootHash → call mintINFT(rootHash)\nIf the upload fails, rootHash is empty and the contract call will always revert.\n\nStep-by-step fix:\n1. Fix the upload error first (usually Mixed Content — indexer URL must be HTTPS)\n2. Add error handling in your mint function:\n   const uploadResult = await uploadMetadata(metadata);\n   if (!uploadResult.rootHash) throw new Error("Upload failed — do not proceed to mint");\n3. Log the rootHash before minting:\n   console.log("rootHash:", uploadResult.rootHash); // must not be empty\n4. Only call mintINFT after confirming rootHash is valid (non-empty 0x... string)\n\nIndexer URLs (must be HTTPS):\n  Testnet: https://indexer-storage-testnet-turbo.0g.ai\n  Mainnet: https://indexer-storage-turbo.0g.ai`);
+
       if (/upload|storage|indexer|merkle|zgblob|zgfile|0g-ts-sdk/.test(s))
-        fixes.push(`FIX — Storage\n1. Use browser SDK in Next.js:\n   import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser"\n2. Testnet indexer: https://indexer-storage-testnet-turbo.0g.ai\n3. Mainnet indexer: https://indexer-storage-turbo.0g.ai\n4. Always return { rootHash, txHash } after upload\n5. Get tokens: https://faucet.0g.ai`);
+        fixes.push(`FIX — Storage\n1. Indexer URL MUST be HTTPS (browsers block HTTP from HTTPS pages):\n   ✅ https://indexer-storage-testnet-turbo.0g.ai\n2. Use browser SDK in Next.js:\n   import { Blob as ZgBlob, Indexer } from "@0gfoundation/0g-ts-sdk/browser"\n3. Mainnet indexer: https://indexer-storage-turbo.0g.ai\n4. Always check upload result before using rootHash\n5. Get tokens: https://faucet.0g.ai`);
       if (/insufficient|balance|gas|fee|funds/.test(s))
         fixes.push(`FIX — No Balance\nhttps://faucet.0g.ai — 0.1 0G free per day\nhttps://cloud.google.com/application/web3/faucet/0g/galileo\nCheck balance: https://chainscan-galileo.0g.ai`);
       if (/private key|signer|wallet|account/.test(s))

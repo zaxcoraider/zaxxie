@@ -883,9 +883,24 @@ const handler = createMcpHandler(
         "zero-coding": "https://build.0g.ai/zero-coding/",
       };
       const url = urls[topic];
+      // Check KV cron cache first (populated by /api/cron nightly)
+      if (KV_CONFIGURED && topic !== "zero-coding") {
+        try {
+          const cached = await memGet<string>(`zaxxie:docs:${topic}`);
+          if (cached) {
+            const lastRefresh = await memGet<string>("zaxxie:docs:last_refresh");
+            return { content: [{ type: "text", text: JSON.stringify({
+              source: "kv-cache", topic, url,
+              cachedAt: lastRefresh ?? "unknown",
+              content: cached,
+            }, null, 2) }] };
+          }
+        } catch { /* fall through to live fetch */ }
+      }
+
       try {
         const res = await fetch(url, {
-          headers: { "User-Agent": "Zaxxie-MCP/3.0 zaxxie.vercel.app" },
+          headers: { "User-Agent": "Zaxxie-MCP/4.0 zaxxie.vercel.app" },
           signal: AbortSignal.timeout(8_000),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -896,10 +911,10 @@ const handler = createMcpHandler(
           .replace(/<[^>]+>/g, " ")
           .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#\d+;/g, " ")
           .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim().slice(0, 8000);
-        return { content: [{ type: "text", text: JSON.stringify({ source: url, topic, content: text }, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ source: "live", topic, url, content: text }, null, 2) }] };
       } catch (e) {
         const fallback = buildDocs(topic === "zero-coding" ? "all" : topic);
-        return { content: [{ type: "text", text: JSON.stringify({ source: "cached", topic, fetchError: (e as Error).message, content: fallback }) }] };
+        return { content: [{ type: "text", text: JSON.stringify({ source: "cached-static", topic, fetchError: (e as Error).message, content: fallback }) }] };
       }
     });
 
@@ -1134,7 +1149,7 @@ const handler = createMcpHandler(
         const msg = (e as Error).message;
         return { content: [{ type: "text", text: JSON.stringify({
           success: false, error: msg,
-          tip: msg.includes("Compilation failed") ? "Check your Solidity source for syntax errors"
+          tip: msg.includes("Compilation failed") ? "Check your Solidity source for syntax errors. Note: inline compilation does not support external imports like @openzeppelin — use zaxxie_build to generate a full Hardhat project instead"
             : msg.includes("insufficient") ? "Get tokens at https://faucet.0g.ai"
             : msg.includes("bytecode") ? "Bytecode is empty — contract may be abstract. Add soliditySource instead."
             : "Run zaxxie_troubleshoot with this error for help",
@@ -1297,19 +1312,21 @@ const handler = createMcpHandler(
             throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} 0G. Get tokens at https://faucet.0g.ai`);
 
           const [zgFile, fileErr] = await ZgFile.fromFilePath(tmpPath);
-          if (fileErr) throw new Error(`File preparation failed: ${fileErr}`);
+          if (fileErr || !zgFile) throw new Error(`File preparation failed: ${fileErr}`);
 
-          const [tree, treeErr] = await zgFile.merkleTree();
-          if (treeErr) throw new Error(`Merkle tree failed: ${treeErr}`);
+          try {
+            const [tree, treeErr] = await zgFile.merkleTree();
+            if (treeErr || !tree) throw new Error(`Merkle tree failed: ${treeErr}`);
 
-          const rootHash = tree!.rootHash();
-          const indexer = new Indexer(INDEXER[network]);
-          const [txHash, uploadErr] = await indexer.upload(zgFile, RPC[network], wallet);
-          if (uploadErr) throw new Error(`Upload failed: ${uploadErr}`);
+            const rootHash = tree.rootHash();
+            const indexer = new Indexer(INDEXER[network]);
+            const [txHash, uploadErr] = await indexer.upload(zgFile, RPC[network], wallet);
+            if (uploadErr) throw new Error(`Upload failed: ${uploadErr}`);
 
-          await zgFile.close();
+            // Always close the file handle
+            await zgFile.close();
 
-          // Auto-save to memory
+            // Auto-save to memory
           if (walletAddress) {
             await appendMemory(walletAddress, "uploads", {
               label: projectLabel ?? filename,
@@ -1330,6 +1347,11 @@ const handler = createMcpHandler(
             warning: "Save the root hash — it's the only way to retrieve this file",
             memorySaved: !!walletAddress,
           }, null, 2) }] };
+          } catch (uploadError) {
+            // Ensure file handle is closed even on upload failure
+            try { await zgFile.close(); } catch { /* ignore */ }
+            throw uploadError;
+          }
         } finally {
           // Always clean up temp file
           try { (await import("fs")).unlinkSync(tmpPath); } catch { /* ignore */ }
@@ -1540,7 +1562,7 @@ const handler = createMcpHandler(
           owner,
           repoName,
           branch,
-          filespushed: files.length,
+          filesPushed: files.length,
           commitSha: newCommit.sha.slice(0, 7),
           cloneUrl: `https://github.com/${owner}/${repoName}.git`,
           message: `✅ ${files.length} files pushed to ${repoUrl}`,
@@ -1726,7 +1748,8 @@ const handler = createMcpHandler(
             name: projectName,
             gitSource: {
               type: "github",
-              repoId: `${repoOwner}/${repoRepo}`,
+              org: repoOwner,   // owner login — NOT "owner/repo"
+              repo: repoRepo,   // repo name only
               ref: "main",
             },
             projectId,
@@ -1761,6 +1784,182 @@ const handler = createMcpHandler(
             : msg.includes("GitHub") ? "Ensure your Vercel account is connected to GitHub at vercel.com/account/git"
             : msg.includes("repo URL") ? "Use the repoUrl returned by zaxxie_push_github"
             : "Check your vercelToken and projectName — projectName must be lowercase with hyphens only",
+        }) }] };
+      }
+    });
+
+    // ══════════════════════════════════════════════════════
+    // TIER 3 — SMARTER
+    // ══════════════════════════════════════════════════════
+
+    // 21. LIVE MODELS — real-time compute provider fetch
+    server.registerTool("zaxxie_live_models", {
+      title: "Live 0G AI Models",
+      description: "Fetches the live list of AI model providers from the 0G Compute marketplace in real time — always current pricing, availability, and provider addresses. Falls back to cached list if the marketplace is unreachable. Use this instead of zaxxie_models for up-to-date provider info.",
+      inputSchema: {
+        network: z.enum(["testnet", "mainnet"]).default("mainnet").describe("Which network to fetch providers from"),
+        type: z.enum(["all", "chat", "image", "speech"]).default("all").describe("Filter by model type"),
+      },
+    }, async ({ network, type }) => {
+      const marketplaceBase = network === "testnet"
+        ? "https://gateway-staging.0g.ai"
+        : "https://gateway.0g.ai";
+
+      const fallback = OG_KNOWLEDGE.compute.services[network];
+
+      try {
+        // Attempt live fetch from 0G compute marketplace API
+        const res = await fetch(`${marketplaceBase}/v1/inference/services`, {
+          headers: { "Accept": "application/json", "User-Agent": "zaxxie-mcp" },
+          signal: AbortSignal.timeout(8_000),
+        });
+
+        if (res.ok) {
+          const data = await res.json() as Array<{
+            provider?: string;
+            model?: string;
+            url?: string;
+            type?: string;
+            inputPrice?: string;
+            outputPrice?: string;
+            verifiability?: string;
+          }>;
+
+          const providers = Array.isArray(data) ? data : [];
+          const filtered = type === "all" ? providers
+            : providers.filter(p => {
+              const t = (p.type ?? p.model ?? "").toLowerCase();
+              if (type === "chat") return t.includes("chat") || t.includes("llm") || t.includes("instruct") || t.includes("gpt") || t.includes("deepseek") || t.includes("glm");
+              if (type === "image") return t.includes("image") || t.includes("diffusion") || t.includes("flux");
+              if (type === "speech") return t.includes("whisper") || t.includes("speech") || t.includes("audio");
+              return true;
+            });
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            source: "live",
+            network,
+            marketplace: `https://compute-marketplace.0g.ai/inference`,
+            fetchedAt: new Date().toISOString(),
+            count: filtered.length,
+            providers: filtered,
+            note: "Provider addresses change frequently — always use the latest from this tool",
+          }, null, 2) }] };
+        }
+
+        throw new Error(`Marketplace returned ${res.status}`);
+      } catch {
+        // Graceful fallback to cached list
+        const cached = type === "all" ? fallback
+          : fallback.filter((s: { model: string; type: string }) => {
+            const t = (s.type ?? "").toLowerCase();
+            if (type === "chat") return t.includes("chat") || t.includes("chatbot");
+            if (type === "image") return t.includes("image");
+            if (type === "speech") return t.includes("speech");
+            return true;
+          });
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          source: "cached",
+          network,
+          warning: "Could not reach 0G marketplace API — showing cached list. Prices/availability may be outdated.",
+          marketplace: "https://compute-marketplace.0g.ai/inference",
+          cachedAt: "2025-Q2",
+          count: cached.length,
+          providers: cached,
+          note: "Visit the marketplace link for live provider addresses and pricing",
+        }, null, 2) }] };
+      }
+    });
+
+    // 22. MONITOR — watch contract events
+    server.registerTool("zaxxie_monitor", {
+      title: "Monitor Contract Events",
+      description: "Fetch recent events emitted by any deployed 0G contract. Filter by event name, block range, or get the last N blocks of activity. Use after deploying to verify your contract is working — or to watch for transfers, mints, approvals, or any custom event.",
+      inputSchema: {
+        address: z.string().describe("Contract address to monitor (0x...)"),
+        abi: z.string().describe("Contract ABI as JSON string"),
+        eventName: z.string().optional().describe("Event name to filter (e.g. 'Transfer', 'Mint') — omit to get all events"),
+        lastNBlocks: z.number().default(1000).describe("How many recent blocks to scan (default 1000, max 10000)"),
+        network: z.enum(["testnet", "mainnet"]).default("testnet"),
+      },
+    }, async ({ address, abi, eventName, lastNBlocks, network }) => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let parsedAbi: any[];
+        try { parsedAbi = JSON.parse(abi); }
+        catch { throw new Error("Invalid ABI — must be valid JSON string"); }
+
+        const provider = new ethers.JsonRpcProvider(RPC[network]);
+        const contract = new ethers.Contract(address, parsedAbi, provider);
+
+        // Get current block
+        const currentBlock = await provider.getBlockNumber();
+        const safeRange = Math.min(lastNBlocks, 10_000);
+        const fromBlock = Math.max(0, currentBlock - safeRange);
+
+        // Validate event exists in ABI if specified
+        if (eventName) {
+          const eventFragment = parsedAbi.find(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (f: any) => f.type === "event" && f.name === eventName
+          );
+          if (!eventFragment) {
+            const events = parsedAbi
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .filter((f: any) => f.type === "event")
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              .map((f: any) => f.name);
+            throw new Error(`Event '${eventName}' not found in ABI. Available events: ${events.join(", ") || "none"}`);
+          }
+        }
+
+        // Query events
+        const filter = eventName ? contract.filters[eventName]?.() : {};
+        if (eventName && !filter) throw new Error(`Could not build filter for event '${eventName}'`);
+
+        const logs = await contract.queryFilter(filter ?? {}, fromBlock, currentBlock);
+
+        // Serialize events
+        const serialize = (val: unknown): unknown => {
+          if (typeof val === "bigint") return val.toString();
+          if (Array.isArray(val)) return val.map(serialize);
+          if (val && typeof val === "object") {
+            return Object.fromEntries(
+              Object.entries(val as Record<string, unknown>).map(([k, v]) => [k, serialize(v)])
+            );
+          }
+          return val;
+        };
+
+        const events = logs.map(log => {
+          const parsed = "args" in log ? log : null;
+          return {
+            event: parsed && "fragment" in parsed ? (parsed as { fragment: { name: string } }).fragment.name : "unknown",
+            blockNumber: log.blockNumber,
+            txHash: log.transactionHash,
+            args: parsed && "args" in parsed ? serialize((parsed as { args: unknown }).args) : null,
+            explorerUrl: `${EXPLORER[network]}/tx/${log.transactionHash}`,
+          };
+        });
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          contractAddress: address,
+          network,
+          scannedBlocks: { from: fromBlock, to: currentBlock, count: safeRange },
+          eventFilter: eventName ?? "all events",
+          totalFound: events.length,
+          events: events.slice(0, 100), // return max 100 events
+          truncated: events.length > 100,
+          explorerUrl: `${EXPLORER[network]}/address/${address}`,
+        }, null, 2) }] };
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("not found in ABI") ? "Check the event name — it's case-sensitive (e.g. 'Transfer' not 'transfer')"
+            : msg.includes("Invalid ABI") ? "Pass the ABI from zaxxie_deploy_contract output or your artifacts/ folder"
+            : "Try reducing lastNBlocks to 500 if the RPC times out",
         }) }] };
       }
     });

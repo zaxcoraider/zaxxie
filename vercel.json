@@ -1,5 +1,15 @@
 {
+  "functions": {
+    "app/api/mcp/route.ts": {
+      "memory": 1024,
+      "maxDuration": 120
+    }
+  },
   "crons": [
+    {
+      "path": "/api/ping",
+      "schedule": "*/5 * * * *"
+    },
     {
       "path": "/api/cron",
       "schedule": "0 2 * * *"

@@ -1,3 +1,5 @@
+// Performance: solc (9.6MB) and @0gfoundation/0g-ts-sdk (5.5MB) are excluded
+// from the webpack bundle via next.config.mjs externals — loaded at runtime only.
 import { z } from "zod";
 import { createMcpHandler } from "mcp-handler";
 import { ethers } from "ethers";
@@ -52,6 +54,19 @@ function hexToEth(hex: string | null | undefined): string {
 function hexToInt(hex: string | null | undefined): number {
   if (!hex || hex === "0x") return 0;
   return parseInt(hex, 16);
+}
+
+// ─── In-process response cache (survives warm invocations, resets on cold start) ─
+// Static tools (network info, docs, models) cache their output for 60s so
+// repeated calls within the same warm instance return instantly.
+const _cache = new Map<string, { data: string; expires: number }>();
+function cacheGet(key: string): string | null {
+  const entry = _cache.get(key);
+  if (!entry || Date.now() > entry.expires) return null;
+  return entry.data;
+}
+function cacheSet(key: string, data: string, ttlMs = 60_000): void {
+  _cache.set(key, { data, expires: Date.now() + ttlMs });
 }
 
 // ─── Memory helpers (Vercel KV) ───────────────────────────────────────────────
@@ -1254,7 +1269,12 @@ const handler = createMcpHandler(
         topic: z.enum(["chain","storage","compute","da","infts","network","all"]),
       },
     }, async ({ topic }) => {
-      return { content: [{ type: "text", text: buildDocs(topic) }] };
+      const cacheKey = `docs:${topic}`;
+      const hit = cacheGet(cacheKey);
+      if (hit) return { content: [{ type: "text", text: hit }] };
+      const result = buildDocs(topic);
+      cacheSet(cacheKey, result, 5 * 60_000); // 5 min TTL
+      return { content: [{ type: "text", text: result }] };
     });
 
     // 12. SCAFFOLD
@@ -1279,12 +1299,17 @@ const handler = createMcpHandler(
         network: z.enum(["testnet","mainnet","both"]).default("testnet"),
       },
     }, async ({ network }) => {
+      const cacheKey = `network:${network}`;
+      const hit = cacheGet(cacheKey);
+      if (hit) return { content: [{ type: "text", text: hit }] };
       const info: Record<string, unknown> = {};
       if (network !== "mainnet") info.testnet = OG_KNOWLEDGE.networks.testnet;
       if (network !== "testnet") info.mainnet = OG_KNOWLEDGE.networks.mainnet;
       info.sdks = OG_KNOWLEDGE.sdks;
       info.links = OG_KNOWLEDGE.links;
-      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      const result = JSON.stringify(info, null, 2);
+      cacheSet(cacheKey, result, 10 * 60_000); // 10 min TTL — static data
+      return { content: [{ type: "text", text: result }] };
     });
 
     // 14. MODELS
@@ -1295,12 +1320,17 @@ const handler = createMcpHandler(
         network: z.enum(["testnet","mainnet","both"]).default("both"),
       },
     }, async ({ network }) => {
+      const cacheKey = `models:${network}`;
+      const hit = cacheGet(cacheKey);
+      if (hit) return { content: [{ type: "text", text: hit }] };
       const info: Record<string, unknown> = {};
       if (network !== "mainnet") info.testnet = OG_KNOWLEDGE.compute.services.testnet;
       if (network !== "testnet") info.mainnet = OG_KNOWLEDGE.compute.services.mainnet;
       info.marketplace = OG_KNOWLEDGE.networks.testnet.computeMarketplace;
       info.note = "OpenAI-compatible API. Get Bearer token: 0g-compute-cli inference get-secret --provider <ADDR>";
-      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+      const result = JSON.stringify(info, null, 2);
+      cacheSet(cacheKey, result, 10 * 60_000);
+      return { content: [{ type: "text", text: result }] };
     });
 
     // ══════════════════════════════════════════════════════

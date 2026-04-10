@@ -333,6 +333,72 @@ export async function chat(providerAddress: string, userMessage: string): Promis
 `;
 }
 
+function genGlobalsCss(): string {
+  return `@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0a0a12;
+  --surface: rgba(255,255,255,0.04);
+  --border: rgba(255,255,255,0.08);
+  --primary: #7C5CFC;
+  --accent: #00D4FF;
+  --text: #E8E8F0;
+  --muted: #888899;
+  --success: #00D68F;
+  --error: #FF5C7A;
+  --warn: #FFB400;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+body {
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(124,92,252,0.13), transparent),
+    var(--bg);
+}
+
+::selection { background: rgba(124,92,252,0.35); }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 3px; }
+
+a { color: var(--primary); text-decoration: none; }
+a:hover { opacity: 0.8; }
+`;
+}
+
+function genLayoutTsx(title: string, description: string): string {
+  return `import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "${title}",
+  description: "${description}",
+};
+
+export default function Layout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+      </head>
+      <body>{children}</body>
+    </html>
+  );
+}
+`;
+}
+
 function genStoragePage(idea: string): string {
   return `"use client";
 import { useState, useRef } from "react";
@@ -345,67 +411,92 @@ export default function Home() {
   const [key, setKey] = useState("");
   const [rootHash, setRootHash] = useState("");
   const [dlHash, setDlHash] = useState("");
-  const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ type: "idle"|"loading"|"success"|"error"; msg: string }>({ type: "idle", msg: "" });
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function handleUpload() {
     const file = fileRef.current?.files?.[0];
-    if (!file) return setStatus("Select a file first.");
-    if (!key) return setStatus("Enter your private key.");
-    setBusy(true);
+    if (!file) return setStatus({ type: "error", msg: "Select a file first." });
+    if (!key) return setStatus({ type: "error", msg: "Enter your private key." });
+    setStatus({ type: "loading", msg: "Uploading to 0G decentralized storage..." });
     try {
-      setStatus("Uploading to 0G decentralized storage...");
       const r = await uploadFile(file, key);
       setRootHash(r.rootHash);
-      setStatus("✅ Uploaded! Save the root hash below — you need it to retrieve the file.");
-    } catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+      setStatus({ type: "success", msg: "Uploaded! Save your root hash below." });
+    } catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
   async function handleDownload() {
-    if (!dlHash) return setStatus("Enter a root hash to download.");
-    setBusy(true);
+    if (!dlHash) return setStatus({ type: "error", msg: "Enter a root hash." });
+    setStatus({ type: "loading", msg: "Downloading from 0G..." });
     try {
-      setStatus("Downloading from 0G...");
       await downloadFile(dlHash, "./download");
-      setStatus("✅ Downloaded successfully!");
-    } catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+      setStatus({ type: "success", msg: "Downloaded successfully!" });
+    } catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
-  const inp = { width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", boxSizing: "border-box" as const, marginBottom: 12 };
-  const btn = (bg: string) => ({ background: bg, color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", opacity: busy ? 0.6 : 1 });
+  const busy = status.type === "loading";
+
+  const card: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 28, backdropFilter: "blur(20px)" };
+  const inp: React.CSSProperties = { width: "100%", padding: "10px 14px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, color: "var(--text)", fontSize: 14, outline: "none", marginBottom: 20, fontFamily: "inherit" };
+  const label: React.CSSProperties = { display: "block", fontSize: 13, fontWeight: 600, color: "#C8C8D8", marginBottom: 8 };
+  const statusColor = { success: "var(--success)", error: "var(--error)", loading: "var(--muted)", idle: "var(--muted)" }[status.type];
+  const statusBg = { success: "rgba(0,214,143,0.08)", error: "rgba(255,92,122,0.08)", loading: "rgba(255,255,255,0.04)", idle: "transparent" }[status.type];
+  const statusBorder = { success: "rgba(0,214,143,0.2)", error: "rgba(255,92,122,0.2)", loading: "rgba(255,255,255,0.08)", idle: "transparent" }[status.type];
 
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 540, margin: "60px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G Storage App</h1>
-      <p style={{ color: "#666", marginBottom: 28 }}>${idea}</p>
-      <div style={{ background: "#fff8e1", borderRadius: 8, padding: 12, marginBottom: 24, fontSize: 13 }}>
-        ⚠️ Demo only — use a wallet connector (not raw private key) in production.
-      </div>
-      <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Private Key (0x...)</label>
-      <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..." style={inp} />
-      <label style={{ fontWeight: 600, display: "block", marginBottom: 6 }}>File to Upload</label>
-      <input type="file" ref={fileRef} style={{ display: "block", marginBottom: 10 }} />
-      <button onClick={handleUpload} disabled={busy} style={btn("#6C3CE1")}>
-        {busy ? "Working..." : "Upload to 0G Storage"}
-      </button>
-      {rootHash && (
-        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 14, margin: "16px 0" }}>
-          <strong>Root Hash — save this!</strong>
-          <code style={{ display: "block", wordBreak: "break-all", fontSize: 12, marginTop: 6 }}>{rootHash}</code>
+    <main style={{ minHeight: "100vh", padding: "60px 20px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <div style={{ textAlign: "center", marginBottom: 48, maxWidth: 520 }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(124,92,252,0.12)", border: "1px solid rgba(124,92,252,0.25)", borderRadius: 999, padding: "5px 14px", fontSize: 11, color: "var(--primary)", marginBottom: 18, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" as const }}>
+          ◈ 0G Decentralized Storage
         </div>
-      )}
-      <label style={{ fontWeight: 600, display: "block", marginBottom: 4, marginTop: 16 }}>Download by Root Hash</label>
-      <input value={dlHash} onChange={e => setDlHash(e.target.value)} placeholder="0x..." style={inp} />
-      <button onClick={handleDownload} disabled={busy} style={btn("#1e1e2e")}>
-        {busy ? "Working..." : "Download from 0G"}
-      </button>
-      {status && <p style={{ marginTop: 16, fontSize: 14 }}>{status}</p>}
-      <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
-        Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
-        <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
+        <h1 style={{ fontSize: "clamp(28px,5vw,42px)", fontWeight: 800, lineHeight: 1.15, background: "linear-gradient(135deg, #E8E8F0 0%, #888899 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", marginBottom: 12 }}>
+          0G Storage App
+        </h1>
+        <p style={{ color: "var(--muted)", fontSize: 15, lineHeight: 1.6 }}>${idea}</p>
+      </div>
+
+      <div style={{ width: "100%", maxWidth: 520, ...card }}>
+        <div style={{ background: "rgba(255,180,0,0.08)", border: "1px solid rgba(255,180,0,0.2)", borderRadius: 10, padding: "10px 14px", marginBottom: 24, fontSize: 12, color: "var(--warn)", display: "flex", gap: 8 }}>
+          <span>⚠</span><span>Demo only — use RainbowKit or ConnectKit instead of raw private key in production.</span>
+        </div>
+
+        <span style={label}>Private Key</span>
+        <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..." style={inp} />
+
+        <span style={label}>File to Upload</span>
+        <div style={{ background: "rgba(255,255,255,0.03)", border: "1px dashed rgba(255,255,255,0.12)", borderRadius: 10, padding: 16, marginBottom: 20, textAlign: "center" as const }}>
+          <input type="file" ref={fileRef} style={{ color: "var(--muted)", fontSize: 13 }} />
+        </div>
+
+        <button onClick={handleUpload} disabled={busy} style={{ width: "100%", padding: 13, background: busy ? "rgba(124,92,252,0.4)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit" }}>
+          {busy ? "⟳  Working..." : "↑  Upload to 0G Storage"}
+        </button>
+
+        {rootHash && (
+          <div style={{ background: "rgba(0,214,143,0.08)", border: "1px solid rgba(0,214,143,0.2)", borderRadius: 10, padding: 16, marginTop: 20 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "var(--success)", marginBottom: 8, letterSpacing: "0.06em" }}>✓ ROOT HASH — SAVE THIS</div>
+            <code style={{ fontSize: 11, color: "#B8FFE4", wordBreak: "break-all" as const, lineHeight: 1.6 }}>{rootHash}</code>
+          </div>
+        )}
+
+        <div style={{ borderTop: "1px solid var(--border)", margin: "24px 0" }} />
+
+        <span style={label}>Download by Root Hash</span>
+        <input value={dlHash} onChange={e => setDlHash(e.target.value)} placeholder="0x..." style={inp} />
+        <button onClick={handleDownload} disabled={busy} style={{ width: "100%", padding: 13, background: "rgba(0,212,255,0.08)", border: "1px solid rgba(0,212,255,0.25)", borderRadius: 10, color: "var(--accent)", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit" }}>
+          {busy ? "⟳  Working..." : "↓  Download from 0G"}
+        </button>
+
+        {status.msg && (
+          <div style={{ marginTop: 16, padding: "10px 14px", borderRadius: 10, fontSize: 13, background: statusBg, color: statusColor, border: \`1px solid \${statusBorder}\` }}>
+            {status.msg}
+          </div>
+        )}
+      </div>
+
+      <p style={{ marginTop: 40, fontSize: 12, color: "#444455", textAlign: "center" as const }}>
+        Powered by <a href="https://0g.ai">0G Zero Gravity</a> · <a href="https://zaxxie.vercel.app">Built with Zaxxie</a>
       </p>
     </main>
   );
@@ -426,59 +517,81 @@ export default function Home() {
   const [selected, setSelected] = useState("");
   const [msg, setMsg] = useState("");
   const [reply, setReply] = useState("");
-  const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ type: "idle"|"loading"|"success"|"error"; msg: string }>({ type: "idle", msg: "" });
 
   async function connect() {
-    setBusy(true);
-    try { setProviders(await listProviders()); setStatus(""); }
-    catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+    setStatus({ type: "loading", msg: "Connecting wallet..." });
+    try { setProviders(await listProviders()); setStatus({ type: "idle", msg: "" }); }
+    catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
   async function send() {
-    if (!selected || !msg) return setStatus("Choose a provider and type a message.");
-    setBusy(true);
-    try { setReply(await chat(selected, msg)); setStatus(""); }
-    catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+    if (!selected || !msg) return setStatus({ type: "error", msg: "Choose a provider and type a message." });
+    setStatus({ type: "loading", msg: "Sending to decentralized AI..." });
+    try { setReply(await chat(selected, msg)); setStatus({ type: "idle", msg: "" }); }
+    catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
+  const busy = status.type === "loading";
+  const card: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 28, backdropFilter: "blur(20px)" };
+  const inp: React.CSSProperties = { width: "100%", padding: "10px 14px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, color: "var(--text)", fontSize: 14, outline: "none", marginBottom: 20, fontFamily: "inherit" };
+  const label: React.CSSProperties = { display: "block", fontSize: 13, fontWeight: 600, color: "#C8C8D8", marginBottom: 8 };
+
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 580, margin: "60px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G AI App</h1>
-      <p style={{ color: "#666", marginBottom: 28 }}>${idea}</p>
-      <button onClick={connect} disabled={busy}
-        style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "11px 24px", borderRadius: 6, cursor: "pointer", fontWeight: 600, marginBottom: 20 }}>
-        {busy ? "Loading..." : "Connect Wallet & Load AI Providers"}
-      </button>
-      {providers.length > 0 && (
-        <>
-          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>AI Model</label>
-          <select value={selected} onChange={e => setSelected(e.target.value)}
-            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 14 }}>
-            <option value="">-- Choose model --</option>
-            {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} — {p.inputPrice}</option>)}
-          </select>
-        </>
-      )}
-      <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Message</label>
-      <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4}
-        placeholder="Ask anything..." style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 8, boxSizing: "border-box" }} />
-      <button onClick={send} disabled={busy}
-        style={{ background: "#1e1e2e", color: "#fff", border: "none", padding: "11px 24px", borderRadius: 6, cursor: "pointer" }}>
-        {busy ? "Thinking..." : "Send to Decentralized AI"}
-      </button>
-      {reply && (
-        <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 8, padding: 16, marginTop: 16 }}>
-          <strong>AI Response</strong>
-          <p style={{ margin: "8px 0 0", lineHeight: 1.7 }}>{reply}</p>
+    <main style={{ minHeight: "100vh", padding: "60px 20px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <div style={{ textAlign: "center", marginBottom: 48, maxWidth: 560 }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(0,212,255,0.1)", border: "1px solid rgba(0,212,255,0.22)", borderRadius: 999, padding: "5px 14px", fontSize: 11, color: "var(--accent)", marginBottom: 18, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" as const }}>
+          ✦ 0G Decentralized AI
         </div>
-      )}
-      {status && <p style={{ marginTop: 14, fontSize: 14 }}>{status}</p>}
-      <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
-        Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
-        <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
+        <h1 style={{ fontSize: "clamp(28px,5vw,42px)", fontWeight: 800, lineHeight: 1.15, background: "linear-gradient(135deg, #E8E8F0 0%, #888899 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", marginBottom: 12 }}>
+          0G AI App
+        </h1>
+        <p style={{ color: "var(--muted)", fontSize: 15, lineHeight: 1.6 }}>${idea}</p>
+      </div>
+
+      <div style={{ width: "100%", maxWidth: 560, ...card }}>
+        <button onClick={connect} disabled={busy} style={{ width: "100%", padding: 13, background: providers.length ? "rgba(0,212,255,0.08)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: providers.length ? "1px solid rgba(0,212,255,0.25)" : "none", borderRadius: 10, color: providers.length ? "var(--accent)" : "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit", marginBottom: 24 }}>
+          {busy && !selected ? "⟳  Connecting..." : providers.length ? \`✓  \${providers.length} AI providers loaded\` : "Connect Wallet & Load AI Providers"}
+        </button>
+
+        {providers.length > 0 && (
+          <>
+            <span style={label}>AI Model</span>
+            <select value={selected} onChange={e => setSelected(e.target.value)} style={{ ...inp, appearance: "none" as const }}>
+              <option value="">— Choose a model —</option>
+              {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} · {p.inputPrice}</option>)}
+            </select>
+          </>
+        )}
+
+        <span style={label}>Your Message</span>
+        <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4} placeholder="Ask anything..."
+          style={{ ...inp, resize: "vertical" as const }} />
+
+        <button onClick={send} disabled={busy} style={{ width: "100%", padding: 13, background: busy ? "rgba(124,92,252,0.4)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit" }}>
+          {busy ? "⟳  Thinking..." : "→  Send to Decentralized AI"}
+        </button>
+
+        {reply && (
+          <div style={{ background: "rgba(0,212,255,0.06)", border: "1px solid rgba(0,212,255,0.18)", borderRadius: 12, padding: 20, marginTop: 20 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", marginBottom: 12, letterSpacing: "0.06em" }}>AI RESPONSE</div>
+            <p style={{ color: "var(--text)", lineHeight: 1.75, fontSize: 14, margin: 0 }}>{reply}</p>
+          </div>
+        )}
+
+        {status.msg && (
+          <div style={{ marginTop: 16, padding: "10px 14px", borderRadius: 10, fontSize: 13,
+            background: status.type === "error" ? "rgba(255,92,122,0.08)" : "rgba(255,255,255,0.04)",
+            color: status.type === "error" ? "var(--error)" : "var(--muted)",
+            border: \`1px solid \${status.type === "error" ? "rgba(255,92,122,0.2)" : "rgba(255,255,255,0.08)"}\`
+          }}>
+            {status.msg}
+          </div>
+        )}
+      </div>
+
+      <p style={{ marginTop: 40, fontSize: 12, color: "#444455", textAlign: "center" as const }}>
+        Powered by <a href="https://0g.ai">0G Zero Gravity</a> · <a href="https://zaxxie.vercel.app">Built with Zaxxie</a>
       </p>
     </main>
   );
@@ -505,99 +618,126 @@ export default function Home() {
   const [selected, setSelected] = useState("");
   const [msg, setMsg] = useState("");
   const [aiReply, setAiReply] = useState("");
-  const [status, setStatus] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ type: "idle"|"loading"|"success"|"error"; msg: string }>({ type: "idle", msg: "" });
   const fileRef = useRef<HTMLInputElement>(null);
 
   async function handleUpload() {
     const file = fileRef.current?.files?.[0];
-    if (!file || !key) return setStatus("Select a file and enter your private key.");
-    setBusy(true);
+    if (!file || !key) return setStatus({ type: "error", msg: "Select a file and enter your private key." });
+    setStatus({ type: "loading", msg: "Uploading to 0G..." });
     try {
-      setStatus("Uploading...");
       const r = await uploadFile(file, key);
       setRootHash(r.rootHash);
-      setStatus("✅ Uploaded!");
-    } catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+      setStatus({ type: "success", msg: "Uploaded! Save your root hash." });
+    } catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
   async function handleConnect() {
-    setBusy(true);
-    try { setProviders(await listProviders()); setStatus(""); }
-    catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+    setStatus({ type: "loading", msg: "Connecting wallet..." });
+    try { setProviders(await listProviders()); setStatus({ type: "idle", msg: "" }); }
+    catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
   async function handleChat() {
-    if (!selected || !msg) return setStatus("Choose a provider and type something.");
-    setBusy(true);
-    try { setAiReply(await chat(selected, msg)); setStatus(""); }
-    catch (e) { setStatus("❌ " + (e as Error).message); }
-    finally { setBusy(false); }
+    if (!selected || !msg) return setStatus({ type: "error", msg: "Choose a provider and type something." });
+    setStatus({ type: "loading", msg: "Thinking..." });
+    try { setAiReply(await chat(selected, msg)); setStatus({ type: "idle", msg: "" }); }
+    catch (e) { setStatus({ type: "error", msg: (e as Error).message }); }
   }
 
-  const tabBtn = (t: Tab) => ({
-    padding: "8px 22px", border: "none", borderRadius: 6, cursor: "pointer", fontWeight: 700, fontSize: 14,
-    background: tab === t ? "#6C3CE1" : "#f0f0f0", color: tab === t ? "#fff" : "#444",
-  } as const);
+  const busy = status.type === "loading";
+  const card: React.CSSProperties = { background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 16, padding: 28, backdropFilter: "blur(20px)" };
+  const inp: React.CSSProperties = { width: "100%", padding: "10px 14px", background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, color: "var(--text)", fontSize: 14, outline: "none", marginBottom: 20, fontFamily: "inherit" };
+  const lbl: React.CSSProperties = { display: "block", fontSize: 13, fontWeight: 600, color: "#C8C8D8", marginBottom: 8 };
 
   return (
-    <main style={{ fontFamily: "system-ui", maxWidth: 600, margin: "60px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4 }}>0G dApp</h1>
-      <p style={{ color: "#666", marginBottom: 24 }}>${idea}</p>
-      <div style={{ display: "flex", gap: 8, marginBottom: 24 }}>
-        <button style={tabBtn("storage")} onClick={() => setTab("storage")}>Storage</button>
-        <button style={tabBtn("ai")} onClick={() => setTab("ai")}>AI Inference</button>
+    <main style={{ minHeight: "100vh", padding: "60px 20px", display: "flex", flexDirection: "column", alignItems: "center" }}>
+      <div style={{ textAlign: "center", marginBottom: 40, maxWidth: 580 }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, background: "rgba(124,92,252,0.12)", border: "1px solid rgba(124,92,252,0.25)", borderRadius: 999, padding: "5px 14px", fontSize: 11, color: "var(--primary)", marginBottom: 18, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" as const }}>
+          ◈ Storage + AI on 0G
+        </div>
+        <h1 style={{ fontSize: "clamp(28px,5vw,42px)", fontWeight: 800, lineHeight: 1.15, background: "linear-gradient(135deg, #E8E8F0 0%, #888899 100%)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", marginBottom: 12 }}>
+          0G dApp
+        </h1>
+        <p style={{ color: "var(--muted)", fontSize: 15, lineHeight: 1.6 }}>${idea}</p>
       </div>
-      {tab === "storage" && (
-        <div>
-          <label style={{ fontWeight: 600, display: "block", marginBottom: 4 }}>Private Key</label>
-          <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..."
-            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 12, boxSizing: "border-box" }} />
-          <input type="file" ref={fileRef} style={{ display: "block", marginBottom: 10 }} />
-          <button onClick={handleUpload} disabled={busy}
-            style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer" }}>
-            {busy ? "Uploading..." : "Upload to 0G"}
+
+      {/* Tab switcher */}
+      <div style={{ display: "flex", gap: 4, background: "rgba(255,255,255,0.04)", border: "1px solid var(--border)", borderRadius: 12, padding: 4, marginBottom: 24 }}>
+        {(["storage", "ai"] as Tab[]).map(t => (
+          <button key={t} onClick={() => setTab(t)} style={{ padding: "8px 24px", border: "none", borderRadius: 9, cursor: "pointer", fontWeight: 700, fontSize: 14, fontFamily: "inherit", transition: "all 0.15s",
+            background: tab === t ? "var(--primary)" : "transparent", color: tab === t ? "#fff" : "var(--muted)" }}>
+            {t === "storage" ? "↑ Storage" : "✦ AI Inference"}
           </button>
-          {rootHash && (
-            <div style={{ background: "#f0fdf4", borderRadius: 8, padding: 12, marginTop: 14 }}>
-              <strong>Root Hash:</strong>
-              <code style={{ display: "block", wordBreak: "break-all", fontSize: 12, marginTop: 4 }}>{rootHash}</code>
+        ))}
+      </div>
+
+      <div style={{ width: "100%", maxWidth: 580, ...card }}>
+        {tab === "storage" && (
+          <div>
+            <div style={{ background: "rgba(255,180,0,0.08)", border: "1px solid rgba(255,180,0,0.2)", borderRadius: 10, padding: "10px 14px", marginBottom: 24, fontSize: 12, color: "var(--warn)", display: "flex", gap: 8 }}>
+              <span>⚠</span><span>Demo only — use RainbowKit instead of raw private key in production.</span>
             </div>
-          )}
-        </div>
-      )}
-      {tab === "ai" && (
-        <div>
-          <button onClick={handleConnect} disabled={busy}
-            style={{ background: "#6C3CE1", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer", marginBottom: 14 }}>
-            Connect Wallet & Load Providers
-          </button>
-          {providers.length > 0 && (
-            <select value={selected} onChange={e => setSelected(e.target.value)}
-              style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 12 }}>
-              <option value="">-- Select model --</option>
-              {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} — {p.inputPrice}</option>)}
-            </select>
-          )}
-          <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4} placeholder="Ask anything..."
-            style={{ width: "100%", padding: 10, borderRadius: 6, border: "1px solid #ddd", marginBottom: 8, boxSizing: "border-box" }} />
-          <button onClick={handleChat} disabled={busy}
-            style={{ background: "#1e1e2e", color: "#fff", border: "none", padding: "10px 22px", borderRadius: 6, cursor: "pointer" }}>
-            {busy ? "Thinking..." : "Ask AI"}
-          </button>
-          {aiReply && (
-            <div style={{ background: "#f0fdf4", borderRadius: 8, padding: 14, marginTop: 14 }}>
-              <p style={{ margin: 0, lineHeight: 1.7 }}>{aiReply}</p>
+            <span style={lbl}>Private Key</span>
+            <input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="0x..." style={inp} />
+            <span style={lbl}>File to Upload</span>
+            <div style={{ background: "rgba(255,255,255,0.03)", border: "1px dashed rgba(255,255,255,0.12)", borderRadius: 10, padding: 16, marginBottom: 20, textAlign: "center" as const }}>
+              <input type="file" ref={fileRef} style={{ color: "var(--muted)", fontSize: 13 }} />
             </div>
-          )}
-        </div>
-      )}
-      {status && <p style={{ marginTop: 14, fontSize: 14 }}>{status}</p>}
-      <p style={{ marginTop: 48, fontSize: 12, color: "#aaa" }}>
-        Powered by <a href="https://0g.ai" style={{ color: "#6C3CE1" }}>0G Zero Gravity</a> ·{" "}
-        <a href="https://zaxxie.vercel.app" style={{ color: "#6C3CE1" }}>Built with Zaxxie</a>
+            <button onClick={handleUpload} disabled={busy} style={{ width: "100%", padding: 13, background: busy ? "rgba(124,92,252,0.4)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit" }}>
+              {busy ? "⟳  Uploading..." : "↑  Upload to 0G Storage"}
+            </button>
+            {rootHash && (
+              <div style={{ background: "rgba(0,214,143,0.08)", border: "1px solid rgba(0,214,143,0.2)", borderRadius: 10, padding: 16, marginTop: 20 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--success)", marginBottom: 8, letterSpacing: "0.06em" }}>✓ ROOT HASH — SAVE THIS</div>
+                <code style={{ fontSize: 11, color: "#B8FFE4", wordBreak: "break-all" as const, lineHeight: 1.6 }}>{rootHash}</code>
+              </div>
+            )}
+          </div>
+        )}
+
+        {tab === "ai" && (
+          <div>
+            <button onClick={handleConnect} disabled={busy} style={{ width: "100%", padding: 13, background: providers.length ? "rgba(0,212,255,0.08)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: providers.length ? "1px solid rgba(0,212,255,0.25)" : "none", borderRadius: 10, color: providers.length ? "var(--accent)" : "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit", marginBottom: 20 }}>
+              {busy && !aiReply ? "⟳  Connecting..." : providers.length ? \`✓  \${providers.length} providers loaded\` : "Connect Wallet & Load AI Providers"}
+            </button>
+            {providers.length > 0 && (
+              <>
+                <span style={lbl}>AI Model</span>
+                <select value={selected} onChange={e => setSelected(e.target.value)} style={{ ...inp, appearance: "none" as const }}>
+                  <option value="">— Choose a model —</option>
+                  {providers.map(p => <option key={p.provider} value={p.provider}>{p.model} · {p.inputPrice}</option>)}
+                </select>
+              </>
+            )}
+            <span style={lbl}>Your Message</span>
+            <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={4} placeholder="Ask anything..."
+              style={{ ...inp, resize: "vertical" as const }} />
+            <button onClick={handleChat} disabled={busy} style={{ width: "100%", padding: 13, background: busy ? "rgba(124,92,252,0.4)" : "linear-gradient(135deg, #7C5CFC, #5B3FDB)", border: "none", borderRadius: 10, color: "#fff", fontWeight: 700, fontSize: 15, cursor: busy ? "not-allowed" : "pointer", fontFamily: "inherit" }}>
+              {busy ? "⟳  Thinking..." : "→  Send to Decentralized AI"}
+            </button>
+            {aiReply && (
+              <div style={{ background: "rgba(0,212,255,0.06)", border: "1px solid rgba(0,212,255,0.18)", borderRadius: 12, padding: 20, marginTop: 20 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", marginBottom: 12, letterSpacing: "0.06em" }}>AI RESPONSE</div>
+                <p style={{ color: "var(--text)", lineHeight: 1.75, fontSize: 14, margin: 0 }}>{aiReply}</p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {status.msg && (
+          <div style={{ marginTop: 16, padding: "10px 14px", borderRadius: 10, fontSize: 13,
+            background: status.type === "success" ? "rgba(0,214,143,0.08)" : status.type === "error" ? "rgba(255,92,122,0.08)" : "rgba(255,255,255,0.04)",
+            color: status.type === "success" ? "var(--success)" : status.type === "error" ? "var(--error)" : "var(--muted)",
+            border: \`1px solid \${status.type === "success" ? "rgba(0,214,143,0.2)" : status.type === "error" ? "rgba(255,92,122,0.2)" : "rgba(255,255,255,0.08)"}\`
+          }}>
+            {status.msg}
+          </div>
+        )}
+      </div>
+
+      <p style={{ marginTop: 40, fontSize: 12, color: "#444455", textAlign: "center" as const }}>
+        Powered by <a href="https://0g.ai">0G Zero Gravity</a> · <a href="https://zaxxie.vercel.app">Built with Zaxxie</a>
       </p>
     </main>
   );
@@ -730,7 +870,8 @@ function buildProject(name: string, idea: string, features: string[], framework:
   if (framework === "nextjs") {
     files.push({ path: "next.config.mjs", content: `/** @type {import('next').NextConfig} */\nconst nextConfig = {};\nexport default nextConfig;\n` });
     files.push({ path: "tsconfig.json", content: JSON.stringify({ compilerOptions: { target: "ES2017", lib: ["dom","dom.iterable","esnext"], allowJs: true, skipLibCheck: true, strict: true, noEmit: true, esModuleInterop: true, module: "esnext", moduleResolution: "bundler", resolveJsonModule: true, isolatedModules: true, jsx: "preserve", incremental: true, paths: { "@/*": ["./*"] } }, include: ["**/*.ts","**/*.tsx"], exclude: ["node_modules"] }, null, 2) });
-    files.push({ path: "app/layout.tsx", content: `export const metadata = { title: "${safe}", description: "${idea.slice(0,100)}" };\nexport default function Layout({ children }: { children: React.ReactNode }) {\n  return <html lang="en"><body style={{ margin: 0 }}>{children}</body></html>;\n}\n` });
+    files.push({ path: "app/globals.css", content: genGlobalsCss() });
+    files.push({ path: "app/layout.tsx", content: genLayoutTsx(safe, idea.slice(0, 100)) });
 
     const hasStorage = features.includes("storage");
     const hasCompute = features.includes("compute");

@@ -1,5 +1,9 @@
 // Performance: solc (9.6MB) and @0gfoundation/0g-ts-sdk (5.5MB) are excluded
 // from the webpack bundle via next.config.mjs externals — loaded at runtime only.
+
+// Vercel function config (Next.js 15 route segment config)
+export const maxDuration = 120;
+
 import { z } from "zod";
 import { createMcpHandler } from "mcp-handler";
 import { ethers } from "ethers";

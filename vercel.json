@@ -1,10 +1,4 @@
 {
-  "functions": {
-    "app/api/mcp/route.ts": {
-      "memory": 1024,
-      "maxDuration": 120
-    }
-  },
   "crons": [
     {
       "path": "/api/ping",

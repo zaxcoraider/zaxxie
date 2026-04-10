@@ -1311,11 +1311,16 @@ const handler = createMcpHandler(
           if (balance < BigInt(1e15))
             throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} 0G. Get tokens at https://faucet.0g.ai`);
 
-          const [zgFile, fileErr] = await ZgFile.fromFilePath(tmpPath);
+          // SDK returns tuple [ZgFile|null, err|null] — cast to any to handle SDK type mismatch
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const fromPathResult = await (ZgFile.fromFilePath(tmpPath) as any);
+          const [zgFile, fileErr] = Array.isArray(fromPathResult) ? fromPathResult : [fromPathResult, null];
           if (fileErr || !zgFile) throw new Error(`File preparation failed: ${fileErr}`);
 
           try {
-            const [tree, treeErr] = await zgFile.merkleTree();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const merkleResult = await (zgFile.merkleTree() as any);
+            const [tree, treeErr] = Array.isArray(merkleResult) ? merkleResult : [merkleResult, null];
             if (treeErr || !tree) throw new Error(`Merkle tree failed: ${treeErr}`);
 
             const rootHash = tree.rootHash();
@@ -1913,13 +1918,7 @@ const handler = createMcpHandler(
           }
         }
 
-        // Query events
-        const filter = eventName ? contract.filters[eventName]?.() : {};
-        if (eventName && !filter) throw new Error(`Could not build filter for event '${eventName}'`);
-
-        const logs = await contract.queryFilter(filter ?? {}, fromBlock, currentBlock);
-
-        // Serialize events
+        // Serialize helper
         const serialize = (val: unknown): unknown => {
           if (typeof val === "bigint") return val.toString();
           if (Array.isArray(val)) return val.map(serialize);
@@ -1931,16 +1930,34 @@ const handler = createMcpHandler(
           return val;
         };
 
-        const events = logs.map(log => {
-          const parsed = "args" in log ? log : null;
-          return {
-            event: parsed && "fragment" in parsed ? (parsed as { fragment: { name: string } }).fragment.name : "unknown",
+        // Query events — use typed filter for named events, provider.getLogs for "all"
+        let events: Array<{ event: string; blockNumber: number; txHash: string; args: unknown; explorerUrl: string }>;
+
+        if (eventName) {
+          const filter = contract.filters[eventName]?.();
+          if (!filter) throw new Error(`Could not build filter for event '${eventName}'`);
+          const logs = await contract.queryFilter(filter, fromBlock, currentBlock);
+          events = logs.map(log => ({
+            event: "fragment" in log ? (log as { fragment: { name: string } }).fragment.name : eventName,
             blockNumber: log.blockNumber,
             txHash: log.transactionHash,
-            args: parsed && "args" in parsed ? serialize((parsed as { args: unknown }).args) : null,
+            args: "args" in log ? serialize((log as { args: unknown }).args) : null,
             explorerUrl: `${EXPLORER[network]}/tx/${log.transactionHash}`,
-          };
-        });
+          }));
+        } else {
+          // All events — use provider.getLogs + decode with Interface
+          const iface = new ethers.Interface(parsedAbi);
+          const rawLogs = await provider.getLogs({ address, fromBlock, toBlock: currentBlock });
+          events = rawLogs.map(log => {
+            let name = "unknown";
+            let args: unknown = null;
+            try {
+              const parsed = iface.parseLog({ topics: [...log.topics], data: log.data });
+              if (parsed) { name = parsed.name; args = serialize(parsed.args); }
+            } catch { /* unparseable log — skip decode */ }
+            return { event: name, blockNumber: log.blockNumber, txHash: log.transactionHash, args, explorerUrl: `${EXPLORER[network]}/tx/${log.transactionHash}` };
+          });
+        }
 
         return { content: [{ type: "text", text: JSON.stringify({
           success: true,

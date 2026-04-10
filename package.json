@@ -1,6 +1,6 @@
 {
   "name": "zaxxie",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
   "description": "Zaxxie — The Ultimate 0G dApp Building Agent. Chain, Storage, Compute, DA, INFTs.",
   "scripts": {

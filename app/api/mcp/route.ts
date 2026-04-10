@@ -1414,6 +1414,357 @@ const handler = createMcpHandler(
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     });
 
+    // ══════════════════════════════════════════════════════
+    // TIER 2 — CLOSE THE LOOP
+    // ══════════════════════════════════════════════════════
+
+    // 18. PUSH TO GITHUB — idea → repo in one conversation
+    server.registerTool("zaxxie_push_github", {
+      title: "Push Project to GitHub",
+      description: "Takes the files array from zaxxie_build and pushes every file directly to a new GitHub repository. No local git needed. Returns the live repo URL. Pair with zaxxie_deploy_vercel to go from idea → live dApp in one conversation.",
+      inputSchema: {
+        githubToken: z.string().describe("GitHub Personal Access Token with 'repo' scope — create at github.com/settings/tokens"),
+        repoName: z.string().describe("Repository name (e.g. my-0g-storage-app) — will be created if it doesn't exist"),
+        files: z.array(z.object({
+          path: z.string().describe("File path relative to repo root (e.g. app/page.tsx)"),
+          content: z.string().describe("Full file content as a string"),
+        })).describe("Files array from zaxxie_build output"),
+        description: z.string().default("Built with Zaxxie — 0G Zero Gravity dApp").describe("Repository description"),
+        isPrivate: z.boolean().default(false).describe("Make the repo private"),
+        branch: z.string().default("main").describe("Branch name"),
+      },
+    }, async ({ githubToken, repoName, files, description, isPrivate, branch }) => {
+      try {
+        const headers = {
+          Authorization: `Bearer ${githubToken}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "Content-Type": "application/json",
+          "User-Agent": "zaxxie-mcp",
+        };
+
+        // Step 1: Get authenticated user
+        const userRes = await fetch("https://api.github.com/user", { headers, signal: AbortSignal.timeout(10_000) });
+        if (!userRes.ok) throw new Error(`GitHub auth failed (${userRes.status}) — check your token has 'repo' scope`);
+        const user = await userRes.json() as { login: string };
+        const owner = user.login;
+
+        // Step 2: Create repo (ignore 422 = already exists)
+        const createRes = await fetch("https://api.github.com/user/repos", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ name: repoName, description, private: isPrivate, auto_init: false }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!createRes.ok && createRes.status !== 422)
+          throw new Error(`Failed to create repo (${createRes.status}): ${await createRes.text()}`);
+
+        // Step 3: Get or create base tree SHA (init repo if empty)
+        let baseTreeSha: string | undefined;
+        let baseCommitSha: string | undefined;
+
+        const refRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}/git/ref/heads/${branch}`, {
+          headers, signal: AbortSignal.timeout(10_000),
+        });
+
+        if (refRes.ok) {
+          const ref = await refRes.json() as { object: { sha: string } };
+          baseCommitSha = ref.object.sha;
+          const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}/git/commits/${baseCommitSha}`, {
+            headers, signal: AbortSignal.timeout(10_000),
+          });
+          const commit = await commitRes.json() as { tree: { sha: string } };
+          baseTreeSha = commit.tree.sha;
+        }
+
+        // Step 4: Create blobs for all files
+        const treeItems = await Promise.all(files.map(async (file) => {
+          const blobRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}/git/blobs`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ content: Buffer.from(file.content).toString("base64"), encoding: "base64" }),
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!blobRes.ok) throw new Error(`Blob creation failed for ${file.path}: ${await blobRes.text()}`);
+          const blob = await blobRes.json() as { sha: string };
+          return { path: file.path, mode: "100644" as const, type: "blob" as const, sha: blob.sha };
+        }));
+
+        // Step 5: Create tree
+        const treeRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}/git/trees`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ tree: treeItems, ...(baseTreeSha ? { base_tree: baseTreeSha } : {}) }),
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!treeRes.ok) throw new Error(`Tree creation failed: ${await treeRes.text()}`);
+        const tree = await treeRes.json() as { sha: string };
+
+        // Step 6: Create commit
+        const commitRes = await fetch(`https://api.github.com/repos/${owner}/${repoName}/git/commits`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            message: `feat: initial 0G dApp — built with Zaxxie\n\nhttps://zaxxie.vercel.app`,
+            tree: tree.sha,
+            ...(baseCommitSha ? { parents: [baseCommitSha] } : { parents: [] }),
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!commitRes.ok) throw new Error(`Commit creation failed: ${await commitRes.text()}`);
+        const newCommit = await commitRes.json() as { sha: string };
+
+        // Step 7: Update (or create) branch ref
+        const updateRef = baseCommitSha
+          ? fetch(`https://api.github.com/repos/${owner}/${repoName}/git/refs/heads/${branch}`, {
+              method: "PATCH",
+              headers,
+              body: JSON.stringify({ sha: newCommit.sha, force: false }),
+              signal: AbortSignal.timeout(10_000),
+            })
+          : fetch(`https://api.github.com/repos/${owner}/${repoName}/git/refs`, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: newCommit.sha }),
+              signal: AbortSignal.timeout(10_000),
+            });
+
+        const refUpdateRes = await updateRef;
+        if (!refUpdateRes.ok) throw new Error(`Ref update failed: ${await refUpdateRes.text()}`);
+
+        const repoUrl = `https://github.com/${owner}/${repoName}`;
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          repoUrl,
+          owner,
+          repoName,
+          branch,
+          filespushed: files.length,
+          commitSha: newCommit.sha.slice(0, 7),
+          cloneUrl: `https://github.com/${owner}/${repoName}.git`,
+          message: `✅ ${files.length} files pushed to ${repoUrl}`,
+          nextStep: `Run zaxxie_deploy_vercel with repoUrl: "${repoUrl}" to get a live dApp URL`,
+        }, null, 2) }] };
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("auth") || msg.includes("401") ? "Create a token at github.com/settings/tokens — enable 'repo' scope"
+            : msg.includes("422") ? "Repo may already exist with conflicting state — try a different repoName"
+            : "Check your githubToken and repoName and try again",
+        }) }] };
+      }
+    });
+
+    // 19. CALL CONTRACT — interact with deployed contracts
+    server.registerTool("zaxxie_call_contract", {
+      title: "Call a 0G Smart Contract",
+      description: "Read or write to any deployed contract on 0G chain. For reads (view/pure functions): no private key needed, returns result instantly. For writes (state-changing): provide private key, returns tx hash. Works with any contract you deployed via zaxxie_deploy_contract.",
+      inputSchema: {
+        address: z.string().describe("Deployed contract address (0x...)"),
+        abi: z.string().describe("Contract ABI as JSON string — from zaxxie_deploy_contract output or artifacts/"),
+        functionName: z.string().describe("Function to call (e.g. 'balanceOf', 'transfer', 'mint')"),
+        args: z.array(z.union([z.string(), z.number(), z.boolean()])).default([]).describe("Function arguments in order"),
+        privateKey: z.string().optional().describe("Private key (0x...) — only needed for write (state-changing) functions"),
+        network: z.enum(["testnet", "mainnet"]).default("testnet"),
+        value: z.string().optional().describe("ETH value to send with tx in 0G (e.g. '0.01') — only for payable functions"),
+      },
+    }, async ({ address, abi, functionName, args, privateKey, network, value }) => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let parsedAbi: any[];
+        try { parsedAbi = JSON.parse(abi); }
+        catch { throw new Error("Invalid ABI — must be valid JSON string"); }
+
+        const provider = new ethers.JsonRpcProvider(RPC[network]);
+
+        // Detect if function is read or write
+        const funcFragment = parsedAbi.find(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (f: any) => f.name === functionName && (f.type === "function" || !f.type)
+        );
+        if (!funcFragment) throw new Error(`Function '${functionName}' not found in ABI. Check the ABI and function name.`);
+
+        const isRead = funcFragment.stateMutability === "view" || funcFragment.stateMutability === "pure";
+
+        if (isRead) {
+          // Read call — no signer needed
+          const contract = new ethers.Contract(address, parsedAbi, provider);
+          const result = await contract[functionName](...args);
+
+          // Serialize result (handle BigInt, arrays, structs)
+          const serialize = (val: unknown): unknown => {
+            if (typeof val === "bigint") return val.toString();
+            if (Array.isArray(val)) return val.map(serialize);
+            if (val && typeof val === "object") {
+              return Object.fromEntries(Object.entries(val as Record<string, unknown>).map(([k, v]) => [k, serialize(v)]));
+            }
+            return val;
+          };
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            success: true,
+            type: "read",
+            function: functionName,
+            args,
+            result: serialize(result),
+            network,
+            contractAddress: address,
+          }, null, 2) }] };
+        } else {
+          // Write call — needs signer
+          if (!privateKey) throw new Error(`'${functionName}' is a write function — provide privateKey to sign the transaction`);
+          if (!privateKey.startsWith("0x") || privateKey.length < 64)
+            throw new Error("Invalid private key — must start with 0x and be 64+ hex chars");
+
+          const wallet = new ethers.Wallet(privateKey, provider);
+          const contract = new ethers.Contract(address, parsedAbi, wallet);
+
+          const txOptions: Record<string, unknown> = {};
+          if (value) txOptions.value = ethers.parseEther(value);
+
+          const tx = await contract[functionName](...args, txOptions);
+          const receipt = await tx.wait();
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            success: true,
+            type: "write",
+            function: functionName,
+            args,
+            txHash: tx.hash,
+            blockNumber: receipt?.blockNumber,
+            gasUsed: receipt?.gasUsed?.toString(),
+            status: receipt?.status === 1 ? "confirmed" : "failed",
+            network,
+            contractAddress: address,
+            explorerUrl: `${EXPLORER[network]}/tx/${tx.hash}`,
+            message: `✅ ${functionName}() executed — tx: ${tx.hash}`,
+          }, null, 2) }] };
+        }
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("not found in ABI") ? "List all functions by checking your ABI — look for 'name' fields"
+            : msg.includes("write function") ? "Add your privateKey parameter to sign this transaction"
+            : msg.includes("insufficient") ? "Get tokens at https://faucet.0g.ai"
+            : "Run zaxxie_troubleshoot with this error for help",
+        }) }] };
+      }
+    });
+
+    // 20. DEPLOY TO VERCEL — idea → live dApp URL
+    server.registerTool("zaxxie_deploy_vercel", {
+      title: "Deploy to Vercel",
+      description: "Deploy a GitHub repository to Vercel and get a live dApp URL. Use after zaxxie_push_github to complete the full flow: idea → zaxxie_build → zaxxie_push_github → zaxxie_deploy_vercel → live URL. Returns the deployment URL and dashboard link.",
+      inputSchema: {
+        vercelToken: z.string().describe("Vercel API token — create at vercel.com/account/tokens"),
+        repoUrl: z.string().describe("GitHub repo URL (e.g. https://github.com/user/my-0g-app) — from zaxxie_push_github output"),
+        projectName: z.string().describe("Vercel project name — must be unique on Vercel (lowercase, hyphens only)"),
+        framework: z.enum(["nextjs", "other"]).default("nextjs").describe("Framework preset"),
+        envVars: z.record(z.string()).optional().describe("Environment variables to set (e.g. { NEXT_PUBLIC_RPC_URL: 'https://evmrpc-testnet.0g.ai' })"),
+      },
+    }, async ({ vercelToken, repoUrl, projectName, framework, envVars }) => {
+      try {
+        const headers = {
+          Authorization: `Bearer ${vercelToken}`,
+          "Content-Type": "application/json",
+        };
+
+        // Parse GitHub repo details from URL
+        const repoMatch = repoUrl.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+        if (!repoMatch) throw new Error("Invalid GitHub repo URL — expected format: https://github.com/owner/repo");
+        const [, repoOwner, repoRepo] = repoMatch;
+
+        // Step 1: Create Vercel project linked to GitHub repo
+        const projectBody: Record<string, unknown> = {
+          name: projectName,
+          framework: framework === "nextjs" ? "nextjs" : null,
+          gitRepository: {
+            type: "github",
+            repo: `${repoOwner}/${repoRepo}`,
+          },
+        };
+
+        if (envVars && Object.keys(envVars).length > 0) {
+          projectBody.environmentVariables = Object.entries(envVars).map(([key, value]) => ({
+            key, value, target: ["production", "preview", "development"], type: "plain",
+          }));
+        }
+
+        const projectRes = await fetch("https://api.vercel.com/v10/projects", {
+          method: "POST",
+          headers,
+          body: JSON.stringify(projectBody),
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        let projectId: string;
+        let deployUrl: string | undefined;
+
+        if (projectRes.ok) {
+          const project = await projectRes.json() as { id: string; name: string };
+          projectId = project.id;
+        } else if (projectRes.status === 400 || projectRes.status === 409) {
+          // Project may already exist — fetch it
+          const listRes = await fetch(`https://api.vercel.com/v9/projects/${projectName}`, {
+            headers, signal: AbortSignal.timeout(10_000),
+          });
+          if (!listRes.ok) throw new Error(`Project creation failed (${projectRes.status}): ${await projectRes.text()}`);
+          const existing = await listRes.json() as { id: string };
+          projectId = existing.id;
+        } else {
+          throw new Error(`Vercel project creation failed (${projectRes.status}): ${await projectRes.text()}`);
+        }
+
+        // Step 2: Trigger a deployment
+        const deployRes = await fetch("https://api.vercel.com/v13/deployments", {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            name: projectName,
+            gitSource: {
+              type: "github",
+              repoId: `${repoOwner}/${repoRepo}`,
+              ref: "main",
+            },
+            projectId,
+            target: "production",
+          }),
+          signal: AbortSignal.timeout(20_000),
+        });
+
+        if (!deployRes.ok) throw new Error(`Deployment trigger failed (${deployRes.status}): ${await deployRes.text()}`);
+        const deploy = await deployRes.json() as { id: string; url: string; inspectorUrl?: string };
+
+        deployUrl = `https://${deploy.url}`;
+        const dashboardUrl = `https://vercel.com/dashboard`;
+        const inspectUrl = deploy.inspectorUrl ?? `https://vercel.com/${repoOwner}/${projectName}`;
+
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          deploymentUrl: deployUrl,
+          dashboardUrl,
+          inspectUrl,
+          projectName,
+          repoUrl,
+          message: `✅ Deploying ${projectName} to Vercel. Live at: ${deployUrl}`,
+          note: "Deployment takes 1-3 minutes to go live. Check inspectUrl for build logs.",
+          fullFlow: "idea → zaxxie_build → zaxxie_push_github → zaxxie_deploy_vercel ✅",
+        }, null, 2) }] };
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("token") || msg.includes("401") ? "Create a Vercel token at vercel.com/account/tokens"
+            : msg.includes("GitHub") ? "Ensure your Vercel account is connected to GitHub at vercel.com/account/git"
+            : msg.includes("repo URL") ? "Use the repoUrl returned by zaxxie_push_github"
+            : "Check your vercelToken and projectName — projectName must be lowercase with hyphens only",
+        }) }] };
+      }
+    });
+
   },
   {},
   { basePath: "/api", maxDuration: 120 }

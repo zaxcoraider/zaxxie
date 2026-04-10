@@ -54,6 +54,75 @@ function hexToInt(hex: string | null | undefined): number {
   return parseInt(hex, 16);
 }
 
+// ─── Memory helpers (Vercel KV) ───────────────────────────────────────────────
+
+const KV_CONFIGURED = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+
+type MemoryEntry = { label: string; data: Record<string, unknown>; createdAt: string };
+type WalletMemory = { contracts: MemoryEntry[]; uploads: MemoryEntry[]; projects: MemoryEntry[]; notes: MemoryEntry[] };
+
+async function memGet<T>(key: string): Promise<T | null> {
+  if (!KV_CONFIGURED) return null;
+  try {
+    const { kv } = await import("@vercel/kv");
+    return kv.get<T>(key);
+  } catch { return null; }
+}
+
+async function memSet(key: string, value: unknown): Promise<void> {
+  if (!KV_CONFIGURED) return;
+  try {
+    const { kv } = await import("@vercel/kv");
+    await kv.set(key, value, { ex: 60 * 60 * 24 * 90 }); // 90-day TTL
+  } catch { /* silent — KV optional */ }
+}
+
+async function appendMemory(wallet: string, type: keyof WalletMemory, entry: MemoryEntry): Promise<void> {
+  const existing = await memGet<WalletMemory>(`zaxxie:${wallet.toLowerCase()}`) ?? { contracts: [], uploads: [], projects: [], notes: [] };
+  existing[type] = [...(existing[type] ?? []), entry].slice(-50); // keep last 50 per type
+  await memSet(`zaxxie:${wallet.toLowerCase()}`, existing);
+}
+
+// ─── Solidity compiler (solc-js) ─────────────────────────────────────────────
+
+interface CompileResult { abi: unknown[]; bytecode: string; contractName: string }
+
+async function compileSolidity(source: string): Promise<CompileResult> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const solc = require("solc") as { compile: (input: string) => string };
+
+  const nameMatch = source.match(/contract\s+(\w+)/);
+  const contractName = nameMatch?.[1] ?? "Contract";
+
+  const input = JSON.stringify({
+    language: "Solidity",
+    sources: { [`${contractName}.sol`]: { content: source } },
+    settings: {
+      evmVersion: "cancun",
+      optimizer: { enabled: true, runs: 200 },
+      outputSelection: { "*": { "*": ["abi", "evm.bytecode"] } },
+    },
+  });
+
+  const raw = solc.compile(input);
+  const output = JSON.parse(raw) as {
+    errors?: Array<{ severity: string; formattedMessage?: string; message: string }>;
+    contracts: Record<string, Record<string, { abi: unknown[]; evm: { bytecode: { object: string } } }>>;
+  };
+
+  const errors = (output.errors ?? []).filter(e => e.severity === "error");
+  if (errors.length) throw new Error("Compilation failed:\n" + errors.map(e => e.formattedMessage ?? e.message).join("\n"));
+
+  const fileContracts = output.contracts[`${contractName}.sol`];
+  if (!fileContracts) throw new Error("No contracts compiled — check your Solidity source");
+
+  const name = Object.keys(fileContracts)[0];
+  const compiled = fileContracts[name];
+  if (!compiled.evm.bytecode.object) throw new Error("Empty bytecode — contract may be abstract or interface-only");
+
+  return { contractName: name, abi: compiled.abi, bytecode: "0x" + compiled.evm.bytecode.object };
+}
+
 // ─── Docs builder ─────────────────────────────────────────────────────────────
 
 function buildDocs(topic: string): string {
@@ -986,67 +1055,90 @@ const handler = createMcpHandler(
     // TIER 3
     // ══════════════════════════════════════════════════════
 
-    // 8. DEPLOY CONTRACT — server-side deployment
+    // 8. DEPLOY CONTRACT — server-side deployment with optional inline compilation
     server.registerTool("zaxxie_deploy_contract", {
       title: "Deploy Contract to 0G",
-      description: "Deploy a compiled smart contract directly to 0G testnet from the server. Provide your private key, ABI (JSON string), and bytecode. Returns the deployed contract address, tx hash, and explorer link. TESTNET ONLY for security.",
+      description: "Deploy a smart contract directly to 0G testnet. Two modes: (A) paste raw Solidity source → Zaxxie compiles + deploys in one step — no local tooling needed; (B) provide pre-compiled ABI + bytecode. Returns contract address, tx hash, and explorer link. TESTNET ONLY.",
       inputSchema: {
         privateKey: z.string().describe("Your private key (0x...) — TESTNET ONLY, never use mainnet key here"),
-        abi: z.string().describe("Contract ABI as a JSON string — from hardhat artifacts or solc output"),
-        bytecode: z.string().describe("Contract bytecode (0x...) — from hardhat artifacts or solc output"),
+        soliditySource: z.string().optional().describe("Raw Solidity source code — Zaxxie compiles it server-side (recommended, no local tools needed)"),
+        abi: z.string().optional().describe("Pre-compiled ABI as JSON string — only needed if NOT using soliditySource"),
+        bytecode: z.string().optional().describe("Pre-compiled bytecode (0x...) — only needed if NOT using soliditySource"),
         constructorArgs: z.array(z.union([z.string(), z.number(), z.boolean()])).default([]).describe("Constructor arguments in order"),
-        contractName: z.string().default("Contract").describe("Contract name — for display only"),
+        contractName: z.string().default("Contract").describe("Contract name — auto-detected from source if using soliditySource"),
+        walletAddress: z.string().optional().describe("Your wallet address — if provided, deployed contract is saved to memory"),
       },
-    }, async ({ privateKey, abi, bytecode, constructorArgs, contractName }) => {
-      // Safety: only testnet
+    }, async ({ privateKey, soliditySource, abi, bytecode, constructorArgs, contractName, walletAddress }) => {
       const network = "testnet" as const;
       try {
-        // Validate inputs
         if (!privateKey.startsWith("0x") || privateKey.length < 64)
-          throw new Error("Invalid private key format — must start with 0x and be 64+ hex chars");
-        if (!bytecode.startsWith("0x"))
-          throw new Error("Bytecode must start with 0x — get it from hardhat artifacts/");
+          throw new Error("Invalid private key — must start with 0x and be 64+ hex chars");
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         let parsedAbi: any[];
-        try { parsedAbi = JSON.parse(abi); }
-        catch { throw new Error("Invalid ABI — must be valid JSON. Get it from artifacts/contracts/YourContract.sol/YourContract.json"); }
+        let finalBytecode: string;
+        let finalName = contractName;
+
+        if (soliditySource) {
+          // Mode A: compile on-server with solc-js
+          const compiled = await compileSolidity(soliditySource);
+          parsedAbi = compiled.abi as typeof parsedAbi;
+          finalBytecode = compiled.bytecode;
+          finalName = compiled.contractName;
+        } else {
+          // Mode B: pre-compiled ABI + bytecode
+          if (!abi) throw new Error("Provide either soliditySource (recommended) or both abi + bytecode");
+          if (!bytecode?.startsWith("0x")) throw new Error("Bytecode must start with 0x");
+          try { parsedAbi = JSON.parse(abi); }
+          catch { throw new Error("Invalid ABI — must be valid JSON"); }
+          finalBytecode = bytecode;
+        }
 
         const provider = new ethers.JsonRpcProvider(RPC[network]);
         const wallet = new ethers.Wallet(privateKey, provider);
 
-        // Check balance before attempting deploy
         const balance = await provider.getBalance(wallet.address);
         if (balance < BigInt(1e15))
           throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} 0G. Get tokens at https://faucet.0g.ai`);
 
-        const factory = new ethers.ContractFactory(parsedAbi, bytecode, wallet);
+        const factory = new ethers.ContractFactory(parsedAbi, finalBytecode, wallet);
         const contract = await factory.deploy(...constructorArgs);
         await contract.waitForDeployment();
 
         const address = await contract.getAddress();
         const txHash = contract.deploymentTransaction()?.hash ?? "";
 
+        // Auto-save to memory if wallet address provided
+        if (walletAddress) {
+          await appendMemory(walletAddress, "contracts", {
+            label: finalName,
+            data: { address, txHash, network: "testnet", chainId: 16602, explorerUrl: `${EXPLORER[network]}/address/${address}` },
+            createdAt: new Date().toISOString(),
+          });
+        }
+
         return { content: [{ type: "text", text: JSON.stringify({
           success: true,
-          contractName,
+          contractName: finalName,
           address,
           txHash,
+          compiledOnServer: !!soliditySource,
           network: "Galileo Testnet",
           chainId: 16602,
           explorerUrl: `${EXPLORER[network]}/address/${address}`,
           txUrl: `${EXPLORER[network]}/tx/${txHash}`,
           verifyCommand: `npx hardhat verify ${address} --network 0g-testnet`,
-          message: `✅ ${contractName} deployed successfully at ${address}`,
+          message: `✅ ${finalName} deployed at ${address}${soliditySource ? " (compiled + deployed server-side)" : ""}`,
         }, null, 2) }] };
       } catch (e) {
         const msg = (e as Error).message;
         return { content: [{ type: "text", text: JSON.stringify({
           success: false, error: msg,
-          tip: msg.includes("insufficient") ? "Get tokens at https://faucet.0g.ai"
-            : msg.includes("ABI") ? "Find ABI at artifacts/contracts/YourContract.sol/YourContract.json after npx hardhat compile"
-            : msg.includes("bytecode") ? "Find bytecode in the same JSON file as ABI"
+          tip: msg.includes("Compilation failed") ? "Check your Solidity source for syntax errors"
+            : msg.includes("insufficient") ? "Get tokens at https://faucet.0g.ai"
+            : msg.includes("bytecode") ? "Bytecode is empty — contract may be abstract. Add soliditySource instead."
             : "Run zaxxie_troubleshoot with this error for help",
+          hint: "Try passing soliditySource instead of abi+bytecode — Zaxxie compiles it for you",
         }) }] };
       }
     });
@@ -1164,9 +1256,167 @@ const handler = createMcpHandler(
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     });
 
+    // ══════════════════════════════════════════════════════
+    // TIER 1 — NEW TOOLS
+    // ══════════════════════════════════════════════════════
+
+    // 15. UPLOAD — server-side file upload to 0G Storage
+    server.registerTool("zaxxie_upload", {
+      title: "Upload File to 0G Storage",
+      description: "Server-side file upload — provide base64 file content and your private key. Zaxxie uploads directly to 0G decentralized storage from the server and returns the root hash. No browser, no local tools, no npm needed. Root hash is auto-saved to memory if walletAddress is provided.",
+      inputSchema: {
+        content: z.string().describe("Base64-encoded file content — use btoa() in browser or Buffer.from(data).toString('base64') in Node"),
+        filename: z.string().describe("File name with extension (e.g. whitepaper.pdf, photo.png, data.json)"),
+        privateKey: z.string().describe("Your private key (0x...) — used to sign the upload transaction"),
+        network: z.enum(["testnet", "mainnet"]).default("testnet"),
+        walletAddress: z.string().optional().describe("Your wallet address — if provided, root hash is saved to memory"),
+        projectLabel: z.string().optional().describe("Label for this upload in memory (e.g. 'project whitepaper')"),
+      },
+    }, async ({ content, filename, privateKey, network, walletAddress, projectLabel }) => {
+      try {
+        if (!privateKey.startsWith("0x") || privateKey.length < 64)
+          throw new Error("Invalid private key — must start with 0x and be 64+ hex chars");
+
+        // Write base64 content to a temp file for the SDK
+        const os = await import("os");
+        const fs = await import("fs");
+        const path = await import("path");
+        const tmpPath = path.join(os.tmpdir(), `zaxxie-${Date.now()}-${filename.replace(/[^a-zA-Z0-9._-]/g, "_")}`);
+
+        const buf = Buffer.from(content, "base64");
+        fs.writeFileSync(tmpPath, buf);
+
+        try {
+          const { ZgFile, Indexer } = await import("@0gfoundation/0g-ts-sdk");
+          const provider = new ethers.JsonRpcProvider(RPC[network]);
+          const wallet = new ethers.Wallet(privateKey, provider);
+
+          // Check balance first
+          const balance = await provider.getBalance(wallet.address);
+          if (balance < BigInt(1e15))
+            throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} 0G. Get tokens at https://faucet.0g.ai`);
+
+          const [zgFile, fileErr] = await ZgFile.fromFilePath(tmpPath);
+          if (fileErr) throw new Error(`File preparation failed: ${fileErr}`);
+
+          const [tree, treeErr] = await zgFile.merkleTree();
+          if (treeErr) throw new Error(`Merkle tree failed: ${treeErr}`);
+
+          const rootHash = tree!.rootHash();
+          const indexer = new Indexer(INDEXER[network]);
+          const [txHash, uploadErr] = await indexer.upload(zgFile, RPC[network], wallet);
+          if (uploadErr) throw new Error(`Upload failed: ${uploadErr}`);
+
+          await zgFile.close();
+
+          // Auto-save to memory
+          if (walletAddress) {
+            await appendMemory(walletAddress, "uploads", {
+              label: projectLabel ?? filename,
+              data: { rootHash, txHash: String(txHash), filename, network, size: buf.length, storageExplorer: `https://storagescan-galileo.0g.ai` },
+              createdAt: new Date().toISOString(),
+            });
+          }
+
+          return { content: [{ type: "text", text: JSON.stringify({
+            success: true,
+            filename,
+            rootHash,
+            txHash: String(txHash),
+            network,
+            sizeBytes: buf.length,
+            storageExplorer: "https://storagescan-galileo.0g.ai",
+            message: `✅ ${filename} uploaded to 0G Storage. Root hash: ${rootHash}`,
+            warning: "Save the root hash — it's the only way to retrieve this file",
+            memorySaved: !!walletAddress,
+          }, null, 2) }] };
+        } finally {
+          // Always clean up temp file
+          try { (await import("fs")).unlinkSync(tmpPath); } catch { /* ignore */ }
+        }
+      } catch (e) {
+        const msg = (e as Error).message;
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false, error: msg,
+          tip: msg.includes("balance") ? "Get tokens at https://faucet.0g.ai"
+            : msg.includes("base64") ? "Encode your file as base64: Buffer.from(fileBuffer).toString('base64')"
+            : "Run zaxxie_troubleshoot with this error for help",
+        }) }] };
+      }
+    });
+
+    // 16. REMEMBER — save to persistent memory
+    server.registerTool("zaxxie_remember", {
+      title: "Save to Zaxxie Memory",
+      description: "Save a contract address, root hash, project info, or any note to Zaxxie's persistent memory — linked to your wallet address. Retrieve later with zaxxie_recall.",
+      inputSchema: {
+        walletAddress: z.string().describe("Your 0G wallet address (0x...) — used as your memory key"),
+        type: z.enum(["contract", "upload", "project", "note"]).describe("Type of memory entry"),
+        label: z.string().describe("Short name/label for this entry (e.g. 'MyToken contract', 'whitepaper v2')"),
+        data: z.record(z.unknown()).describe("Data to store — any key/value pairs relevant to this entry"),
+      },
+    }, async ({ walletAddress, type, label, data }) => {
+      if (!KV_CONFIGURED) {
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false,
+          error: "Memory not configured",
+          setup: "Add Vercel KV to your project: vercel.com/dashboard → Storage → Create KV → Link to project. Env vars KV_REST_API_URL + KV_REST_API_TOKEN will be set automatically.",
+        }) }] };
+      }
+
+      const entry: MemoryEntry = { label, data: data as Record<string, unknown>, createdAt: new Date().toISOString() };
+      const memType = (type + "s") as keyof WalletMemory;
+      await appendMemory(walletAddress, memType, entry);
+
+      return { content: [{ type: "text", text: JSON.stringify({
+        success: true,
+        saved: { type, label, walletAddress, createdAt: entry.createdAt },
+        message: `✅ Saved "${label}" to memory. Retrieve with zaxxie_recall.`,
+      }) }] };
+    });
+
+    // 17. RECALL — retrieve from persistent memory
+    server.registerTool("zaxxie_recall", {
+      title: "Recall from Zaxxie Memory",
+      description: "Retrieve saved contracts, uploaded file hashes, projects, and notes from Zaxxie's persistent memory. Pass your wallet address to see everything saved for you.",
+      inputSchema: {
+        walletAddress: z.string().describe("Your 0G wallet address (0x...) — the memory key"),
+        type: z.enum(["all", "contracts", "uploads", "projects", "notes"]).default("all").describe("Filter by type or get all"),
+      },
+    }, async ({ walletAddress, type }) => {
+      if (!KV_CONFIGURED) {
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: false,
+          error: "Memory not configured",
+          setup: "Add Vercel KV: vercel.com/dashboard → Storage → Create KV → Link to project.",
+        }) }] };
+      }
+
+      const memory = await memGet<WalletMemory>(`zaxxie:${walletAddress.toLowerCase()}`);
+      if (!memory) {
+        return { content: [{ type: "text", text: JSON.stringify({
+          success: true,
+          walletAddress,
+          memory: null,
+          message: "No memory found for this wallet. Deploy a contract or upload a file with walletAddress set to start building your memory.",
+        }) }] };
+      }
+
+      const result: Record<string, unknown> = { walletAddress };
+      if (type === "all" || type === "contracts") result.contracts = memory.contracts ?? [];
+      if (type === "all" || type === "uploads") result.uploads = memory.uploads ?? [];
+      if (type === "all" || type === "projects") result.projects = memory.projects ?? [];
+      if (type === "all" || type === "notes") result.notes = memory.notes ?? [];
+
+      const total = Object.values(result).filter(Array.isArray).reduce((s, a) => s + (a as unknown[]).length, 0);
+      result.summary = `${total} items found for ${walletAddress}`;
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    });
+
   },
   {},
-  { basePath: "/api", maxDuration: 60 }
+  { basePath: "/api", maxDuration: 120 }
 );
 
 export { handler as GET, handler as POST, handler as DELETE };
